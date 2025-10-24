@@ -11,7 +11,7 @@ import mplcursors
 import mne
 
 # Specify the full path to your EDF file
-file_path = r"C:\Users\marti\OneDrive\Documents\HSJD\Cerebelo\Chimula Mark\13.14.edf"  # Change this to your file path
+file_path = r"C:\Users\msedo\Documents\Cerebelo\Chimula Mark\13.14_stim.edf"  # Change this to your file path
 
 raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
 data = raw.get_data()  # shape (n_channels, n_samples)
@@ -20,12 +20,6 @@ sfreq = float(raw.info['sfreq'])
 signals = [data[i].astype(np.float64) for i in range(data.shape[0])]
 sample_frequencies = [sfreq for _ in labels]
 units = ['' for _ in labels]
-
-n_signals = len(signals)
-print(f"Number of signals: {n_signals}")
-for i in range(n_signals):
-    print(f"  {i+1}. {labels[i]} - Sample Rate: {sample_frequencies[i]} Hz - Duration: {len(signals[i])/sample_frequencies[i]:.2f} s")
-
 
 # Select only EEG channels (case-insensitive match for "EEG")
 eeg_idx = [i for i, ch in enumerate(labels) if 'EEG' in ch.upper()]
@@ -54,7 +48,7 @@ n_signals, n_samples = raw_data.shape
 duration_mins = n_samples / (sfreq * 60)
 
 print(f"Sampling frequency: {sfreq} Hz")
-print(f"Number of channels: {n_signals}")
+print(f"Number of EEG channels: {n_signals}")
 print(f"Recording duration: {duration_mins:.2f} min\n")
 
 # -----------------------------Re-referencing------------------------------------
@@ -78,70 +72,233 @@ raw_data = reref_to_channel_numpy(raw_data, eeg_labels, ref_name='EEG Pz')
 '''
 # ----------------------- Signal Visualisation ---------------------------------
 
-# Create plots
-fig, axes = plt.subplots(n_signals, 1, figsize=(14, 3 * n_signals))
+# get events from annotations (if any)
+events, event_id = mne.events_from_annotations(raw_filtered)  # events shape (n_events, 3)
 
-# Handle single signal case
-if n_signals == 1:
-    axes = [axes]
-
-# Plot each signal
-for i in range(n_signals):
-    # Create time array
-    time = np.arange(len(raw_signals[i])) / sample_frequencies[i]*1000
-    
-    # Plot the signal
-    line = axes[i].plot(time, raw_signals[i], linewidth=0.5)
-    axes[i].set_ylabel(f'{labels[i]} ({units[i]})')
-    axes[i].set_xlabel('Time (ms)')
-    axes[i].grid(True, alpha=0.3)
-    axes[i].set_title(f'{labels[i]} - Sample Rate: {sample_frequencies[i]} Hz - Units: {units[i]}')
-    
-    # Add interactive cursor
-    mplcursors.cursor(line, hover=True)
-
-plt.tight_layout()
-plt.show()
+# Launch interactive viewer with events displayed
+# duration controls how many seconds are visible at once
+raw_filtered.plot(n_channels=20, duration=30, scalings='auto', events=events, event_id=event_id)
 
 #------------------------------------------------------------------------------
 
-n_eeg, n_samples = filt_data.shape
-t = []
-np.arange(n_samples) / (sfreq*60)  # time in seconds
 
-# Compute sensible offset: median peak-to-peak across EEG channels
-p2p = np.ptp(filt_data, axis=1)
-finite = p2p[np.isfinite(p2p) & (p2p > 0)]
-if finite.size > 0:
-    base = np.median(finite)
-else:
-    base = np.max(p2p) if p2p.size > 0 else 1.0
-offset = base * 1.5  # multiplier to separate traces
+# --- create 4-second epochs starting at each event onset ---
 
-# Build offsets so first EEG channel is on top
-offsets = np.arange(n_eeg)[::-1] * offset
-stacked = (filt_data - np.mean(filt_data, axis=1, keepdims=True)) + offsets[:, None]
-
-# Plot
-fig, ax = plt.subplots(figsize=(16, max(6, n_eeg * 0.25)))
-lines = []
-for i in range(n_eeg):
-    ln, = ax.plot(t, stacked[i], color='k', linewidth=0.6)
-    lines.append(ln)
-
-# Put channel labels on the y-axis at the offset positions (reverse labels to match stack order)
-ax.set_yticks(offsets)
-ax.set_yticklabels(eeg_labels[::-1], fontsize=9)
-ax.set_xlabel("Time (s)")
-ax.set_ylabel("Amplitude (µV)  (offset applied)")
-ax.set_title("Raw EEG channels (stacked, µV)")
-ax.grid(True, linestyle=':', alpha=0.4)
-ax.set_xlim(t[0], t[-1])
-ax.set_ylim(offsets[-1] - offset * 0.5, offsets[0] + offset * 0.5)
+# desired epoch length in seconds
+epoch_tmin = 0.0
+epoch_tmax = 4.0
 
 
-plt.tight_layout()
+print(f"Requested events: {len(events)}. Example events (first 10 rows):\n{events[:10]}")
+print(f"Event ID mapping: {event_id}")
+
+# Create epochs from raw_filtered (use filtered data in volts; MNE expects SI units)
+raw_for_epochs = raw_filtered.copy()  # filtered in Volts
+
+#raw_for_epochs.drop_channels(['EEG Fp1', 'EEG EOGI', 'EEG Fp2', 'EEG T3', 'EEG T4', 'EEG P4', 'EEG O1', 'EEG EOGD'])
+
+# Create epochs: start at event (tmin=0.0) and last 4 seconds (tmax=4.0)
+epochs = mne.Epochs(raw_for_epochs, events, event_id=event_id,
+                    tmin=epoch_tmin, tmax=epoch_tmax,
+                    picks=eeg_idx, baseline=None, preload=True, verbose=False)
+
+n_requested = len(events)
+n_kept = len(epochs.events)
+n_dropped = n_requested - n_kept
+print(f"Epochs requested: {n_requested}, kept: {n_kept}, dropped: {n_dropped}")
+
+# epoch data shape: (n_epochs, n_channels, n_times)
+edata = epochs.get_data()
+n_epochs, n_channels, n_times = edata.shape
+epoch_duration_s = (n_times - 1) / sfreq  # approximate
+print(f"Epochs shape: {edata.shape} (n_epochs, n_channels, n_times). epoch_duration ≈ {epoch_duration_s:.3f} s")
+
+# If you want epoch data in microvolts (µV):
+edata_uV = edata * 1e6
+
+# Quick checks / visualization
+#  - show average evoked across epochs for first event type (if multiple)
+first_ev_key = list(event_id.keys())[0]
+print(f"Plotting average for event: {first_ev_key}")
+evoked = epochs[first_ev_key].average()
+evoked.plot(spatial_colors=True, picks=eeg_idx)   # interactive MNE plot
+
+# Or plot raw epochs (matplotlib)
+plt.figure(figsize=(12, 6))
+plt.plot(np.arange(n_times) / sfreq, edata.mean(axis=0).T * 1e6)  # mean across epochs, in µV
+plt.xlabel('Time (s)')
+plt.ylabel('Amplitude (µV)')
+plt.title('Mean epoch across events (µV)')
 plt.show()
+
+
+
+
+# PARAMETERS - tune as needed
+search_window = (0.0, 0.25)    # seconds relative to original epoch onset in which to search for the first peak
+epoch_duration_s = 4.0         # desired epoch length after alignment (seconds)
+detection_mode = 'gfp'         # 'gfp' (recommended) or specific channel name from epochs.ch_names
+min_peak_amplitude = None      # optional absolute amplitude threshold (Volts); set to None to disable
+pad_with_nan = True            # pad short epochs with NaN; if False, short epochs are dropped
+
+# --- prepare data ---
+edata = epochs.get_data()                    # (n_epochs, n_channels, n_times) in Volts
+n_epochs, n_channels, n_times = edata.shape
+orig_times = epochs.times                    # seconds (should start near 0.0)
+sfreq = epochs.info['sfreq']
+
+# convert search window to sample indices within epoch
+s0 = np.searchsorted(orig_times, search_window[0])
+s1 = np.searchsorted(orig_times, search_window[1], side='right')
+s0 = max(0, s0)
+s1 = min(n_times, max(s0 + 1, s1))
+print(f"Searching for peak in samples {s0}:{s1-1} (times {orig_times[s0]:.3f}s..{orig_times[s1-1]:.3f}s)")
+
+# detection channel index (if user requested a specific channel)
+det_chan_idx = None
+if detection_mode != 'gfp':
+    if detection_mode in epochs.ch_names:
+        det_chan_idx = epochs.ch_names.index(detection_mode)
+        print(f"Using channel '{detection_mode}' (index {det_chan_idx}) for detection.")
+    else:
+        raise ValueError(f"Requested detection channel '{detection_mode}' not found in epochs.ch_names")
+
+# --- detect first peak sample per epoch ---
+peak_samples = np.full(n_epochs, -1, dtype=int)
+peak_values = np.full(n_epochs, np.nan, dtype=float)
+
+for e in range(n_epochs):
+    if det_chan_idx is not None:
+        sig = edata[e, det_chan_idx, :]
+    else:
+        # GFP (std across channels)
+        sig = np.std(edata[e, :, :], axis=0)
+
+    window = sig[s0:s1]
+    if window.size == 0:
+        continue
+
+    # take the largest absolute deflection in search window as the stim peak
+    local_idx = int(np.argmax(np.abs(window)))
+    global_idx = s0 + local_idx
+    peak_val = sig[global_idx]
+
+    if (min_peak_amplitude is not None) and (abs(peak_val) < min_peak_amplitude):
+        continue
+
+    peak_samples[e] = global_idx
+    peak_values[e] = peak_val
+
+valid_mask = peak_samples >= 0
+n_detected = valid_mask.sum()
+print(f"Detected peaks in {n_detected}/{n_epochs} epochs.")
+
+if n_detected == 0:
+    raise RuntimeError("No peaks detected in any epoch — widen the search_window or check the data.")
+
+# --- crop/align epochs so time 0 is the detected peak and keep epoch_duration_s seconds after peak ---
+new_n_samples = int(round(epoch_duration_s * sfreq))
+aligned = np.full((n_epochs, n_channels, new_n_samples), np.nan, dtype=float)
+kept_epoch_indices = []
+
+for e in range(n_epochs):
+    ps = peak_samples[e]
+    if ps < 0:
+        continue
+    available_after = n_times - ps
+    if available_after <= 0:
+        # nothing after peak
+        continue
+    copy_len = min(available_after, new_n_samples)
+    aligned[e, :, :copy_len] = edata[e, :, ps:ps + copy_len]
+    # decide whether to count this epoch as kept
+    if copy_len == new_n_samples:
+        kept_epoch_indices.append(e)
+    else:
+        if pad_with_nan:
+            kept_epoch_indices.append(e)
+        else:
+            aligned[e, :, :] = np.nan  # will drop later
+
+if not pad_with_nan:
+    # drop epochs that are all NaN
+    valid_epochs_mask = ~np.all(np.isnan(aligned).reshape(n_epochs, -1), axis=1)
+    aligned = aligned[valid_epochs_mask]
+    n_kept = aligned.shape[0]
+    print(f"Dropped partially-short epochs. Kept {n_kept}/{n_epochs} epochs.")
+else:
+    n_kept = len(kept_epoch_indices)
+    print(f"Kept (with padding) {n_kept}/{n_epochs} epochs. {n_epochs - n_kept} have no usable post-peak data.")
+
+aligned_times = np.arange(0, new_n_samples) / sfreq   # time 0 at stimulus peak
+
+
+# channels to ignore
+ignore_channels = [
+    'EEG Fp1', 'EEG Fp2', 'EEG EOGI', 'EEG T3', 'EEG T4',
+    'EEG O1', 'EEG EOGD', 'EEG O2', 'EEG A1', 'EEG A2', 'EEG EOGX'
+]
+
+# Determine which channel-name list corresponds to aligned's channel axis.
+# Prefer aligned_epochs.ch_names or epochs_kept.ch_names if available, otherwise use epochs.ch_names
+if 'aligned_epochs' in globals() and hasattr(aligned_epochs, 'ch_names'):
+    aligned_ch_names = aligned_epochs.ch_names
+elif 'epochs_kept' in globals() and hasattr(epochs_kept, 'ch_names'):
+    aligned_ch_names = epochs_kept.ch_names
+else:
+    # fallback to the original epochs names — this is only correct if aligned was built from epochs
+    aligned_ch_names = epochs.ch_names
+
+# Sanity check: if lengths still mismatch, try to trim or raise informative error
+if aligned.shape[1] != len(aligned_ch_names):
+    raise RuntimeError(
+        f"Channel count mismatch: aligned has {aligned.shape[1]} channels but "
+        f"aligned_ch_names has {len(aligned_ch_names)} entries. Make sure `aligned` "
+        "was built from the same `epochs` object that provides these channel names."
+    )
+
+# Compute kept indices relative to aligned_ch_names (safe)
+kept_indices = [i for i, ch in enumerate(aligned_ch_names) if ch not in ignore_channels]
+kept_names = [aligned_ch_names[i] for i in kept_indices]
+
+if len(kept_indices) == 0:
+    raise RuntimeError("No channels left after excluding ignore_channels.")
+
+# Select retained channels from aligned
+aligned_kept = aligned[:, kept_indices, :]  # shape (n_epochs, n_kept_channels, new_n_samples)
+n_kept_channels = aligned_kept.shape[1]
+
+# --- compute per-channel averages (ignore NaNs) for retained channels only ---
+channel_averages_kept = np.nanmean(aligned_kept, axis=0)   # shape (n_kept_channels, new_n_samples) in Volts
+channel_averages_kept_uV = channel_averages_kept * 1e6     # µV
+
+print(f"Computed channel_averages for {n_kept_channels} retained channels. shape: {channel_averages_kept.shape}")
+print("Retained channels (in plotted order):", kept_names)
+
+# plotting (same as before), using kept_names for titles
+n_cols = 6
+n_rows = int(np.ceil(n_kept_channels / n_cols))
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(3*n_cols, 2.2*n_rows), sharex=True)
+axes = axes.ravel()
+for ch in range(n_kept_channels):
+    ax = axes[ch]
+    ax.plot(aligned_times, channel_averages_kept_uV[ch], color='C0')
+    ax.axvline(0.0, color='k', linestyle='--', alpha=0.6)
+    ax.set_title(kept_names[ch], fontsize=8)
+    if ch % n_cols == 0:
+        ax.set_ylabel('µV')
+for ax in axes[n_kept_channels:]:
+    ax.axis('off')
+axes[-1].set_xlabel('Time (s) (peak = 0)')
+fig.suptitle('Channel-wise averages after peak alignment (retained channels only)')
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+plt.show()
+
+# Optional: build aligned_epochs_kept info from aligned_ch_names
+aligned_info_kept = mne.pick_info(epochs.info if 'epochs' in globals() else aligned_epochs.info, kept_indices)
+aligned_epochs_kept = mne.EpochsArray(aligned_kept, aligned_info_kept, tmin=0.0, verbose=False)
+print("Created aligned_epochs_kept (MNE EpochsArray) with tmin=0.0 (peak aligned).")
+
 
 # ========================== Stimulation spikes detection ====================
 
