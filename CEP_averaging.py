@@ -13,7 +13,7 @@ import math
 import os
 
 # Specify the full path to your EDF file
-file_path = r"C:\Users\marti\OneDrive\Documents\HSJD\Cerebelo\Chimula Mark\13.14_stim.edf"  # Change this to your file path
+file_path = r"C:\Users\msedo\Documents\Cerebelo\Chimula Mark\13.14_stim.edf"  # Change this to your file path
 
 raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
 raw.drop_channels( ['Chin+','ECG+','DI+','DD+','RONQ+','CAN+','TER+','PCO2+','EtCO+','Pos+','Tor+','Abd+','TIBI+','TIBD+','thor+','abdo+','PULS+','BEAT+','SpO2+','MKR+'])
@@ -21,6 +21,23 @@ raw.drop_channels([
     'EEG Fp1', 'EEG Fp2', 'EEG EOGI', 'EEG T3', 'EEG T4',
     'EEG O1', 'EEG EOGD', 'EEG O2', 'EEG A1', 'EEG A2', 'EEG EOGX'
 ])
+# mapping: {old_name: new_name}
+mapping = {
+    'EEG F3': 'EEG F1',
+    'EEG F7': 'EEG F3',
+    'EEG C3' : 'EEG C1',
+    'EEG P3' : 'EEG CP1',
+    'EEG T5' : 'EEG CP3',
+    'EEG F4' : 'EEG F2',
+    'EEG F8' : 'EEG F4',
+    'EEG C4' : 'EEG C2',
+    'EEG P4' : 'EEG CP2',
+    'EEG T6' : 'EEG CP4'
+
+}
+
+raw.rename_channels(mapping)      # modifies raw in-place
+print(raw.ch_names[:20])
 data = raw.get_data()  # shape (n_channels, n_samples)
 labels = raw.ch_names
 sfreq = float(raw.info['sfreq'])
@@ -105,7 +122,7 @@ raw_filtered.plot(n_channels=20, duration=30, scalings='auto', events=events, ev
 
 # desired epoch length in seconds
 epoch_tmin = 0.0
-epoch_tmax = 1
+epoch_tmax = 0.5
 
 print(f"Requested events: {len(events)}. Example events (first 10 rows):\n{events[:10]}")
 print(f"Event ID mapping: {event_id}")
@@ -133,6 +150,7 @@ first_ev_key = list(event_id.keys())[0]
 print(f"Plotting average for event: {first_ev_key}")
 evoked = epochs[first_ev_key].average()
 evoked.plot(spatial_colors=True)   # interactive MNE plot
+
 
 
 # ----------------- Per channel average ------------------------------
@@ -177,6 +195,7 @@ for i in range(n_ch):
     ax = axes[i]
     ax.plot(times, mean_uV[i], color='C0', lw=1)
     ax.axvline(0.0, color='k', linestyle='--', alpha=0.6)   # event onset / alignment
+    ax.axhline(0, color='k', linestyle='-', alpha=0.4, linewidth=0.8)
     ax.set_title(ch_names[i], fontsize=8)
     if i % n_cols == 0:
         ax.set_ylabel('µV')
@@ -188,6 +207,161 @@ for ax in axes[n_ch:]:
 fig.suptitle("Per-channel mean across all epochs (µV)")
 plt.tight_layout(rect=[0, 0, 1, 0.96])
 plt.show()
+
+
+
+
+def plot_all_epochs_per_channel(
+    edata_sources=None,
+    times=None,
+    ch_names=None,
+    sfreq=None,
+    n_cols=6,
+    epoch_alpha=0.25,
+    epoch_lw=0.6,
+    mean_color='C1',
+    mean_lw=1.5,
+    vmax_abs_convert=1e-2,
+    figsize_per_col=(3, 2.2)
+):
+    """
+    Plot all epochs per channel: each subplot contains all epochs for that channel (overlayed),
+    plus the channel mean on top.
+
+    Parameters
+    ----------
+    edata_sources : dict or None
+        Optional dict of possible variable names to check for epoch data, e.g.
+        {'edata': globals().get('edata'), 'edata_good': globals().get('edata_good'), ...}
+        If None, the function will try common global names itself.
+        Accepted epoch array shape: (n_epochs, n_channels, n_times)
+    times : ndarray or None
+        Time vector (n_times,) in seconds. If None, will attempt to use epochs.times or construct from sfreq.
+    ch_names : list or None
+        Channel names (length n_channels). If None, will try epochs.ch_names or create generic names.
+    sfreq : float or None
+        Sampling frequency (Hz) — used only if times is None to synthesize a time vector.
+    n_cols : int
+        Number of subplot columns.
+    epoch_alpha, epoch_lw : float
+        Alpha and linewidth for individual epoch traces.
+    mean_color, mean_lw : color/float
+        Color and linewidth for the averaged trace plotted on top.
+    vmax_abs_convert : float
+        Threshold to decide if data is in Volts (abs max < threshold) — then convert to µV.
+    figsize_per_col : tuple
+        Width/height multipliers per column used to build figsize.
+    """
+    # Try to locate epoch data if not provided explicitly
+    edata = None
+    if edata_sources is None:
+        # common names used in this session
+        candidates = ['edata', 'edata_uV', 'edata_good', 'edata_baselined', 'edata_cropped_all', 'epochs_data']
+        g = globals()
+        for name in candidates:
+            if name in g and g[name] is not None:
+                arr = g[name]
+                if isinstance(arr, np.ndarray) and arr.ndim == 3:
+                    edata = arr
+                    break
+        # fallback to epochs object if present
+        if edata is None and 'epochs' in g:
+            try:
+                edata = g['epochs'].get_data()
+            except Exception:
+                edata = None
+    else:
+        # check provided dict for valid arrays
+        for name, arr in edata_sources.items():
+            if isinstance(arr, np.ndarray) and arr.ndim == 3:
+                edata = arr
+                break
+
+    if edata is None:
+        raise RuntimeError("No epoch data found. Provide edata (n_epochs,n_ch,n_times) or an epochs object.")
+
+    n_epochs, n_ch, n_times = edata.shape
+
+    # Determine times vector
+    if times is None:
+        g = globals()
+        if 'times_cropped_all' in g:
+            times = g['times_cropped_all']
+        elif 'times' in g:
+            times = g['times']
+        elif 'epochs' in g:
+            try:
+                times = g['epochs'].times
+            except Exception:
+                times = None
+        if times is None:
+            if sfreq is None:
+                # attempt to get sfreq from epochs.info if available
+                if 'epochs' in g and hasattr(g['epochs'], 'info'):
+                    sfreq = g['epochs'].info.get('sfreq', None)
+            if sfreq is None:
+                raise RuntimeError("No time vector available and sfreq not provided.")
+            times = np.arange(n_times) / float(sfreq)
+
+    # Determine channel names
+    if ch_names is None:
+        g = globals()
+        if 'epochs' in g:
+            try:
+                ch_names = list(g['epochs'].ch_names)
+            except Exception:
+                ch_names = None
+        if ch_names is None:
+            ch_names = [f"ch{i}" for i in range(n_ch)]
+
+    assert len(ch_names) == n_ch, f"Channel name count ({len(ch_names)}) != data channels ({n_ch})"
+
+    # Convert to µV if values are in Volts (heuristic)
+    if np.nanmax(np.abs(edata)) < vmax_abs_convert:
+        edata_uV = edata * 1e6
+    else:
+        edata_uV = edata.copy()
+
+    # Prepare plotting grid
+    n_rows = int(math.ceil(n_ch / n_cols))
+    figsize = (figsize_per_col[0] * n_cols, figsize_per_col[1] * n_rows)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, sharex=True)
+    axes = axes.ravel()
+
+    for ch in range(n_ch):
+        ax = axes[ch]
+        # Plot all epochs for this channel
+        for ep in range(n_epochs):
+            ax.plot(times, edata_uV[ep, ch, :], color='C0', alpha=epoch_alpha, lw=epoch_lw)
+
+        # Plot mean on top
+        mean_trace = np.nanmean(edata_uV[:, ch, :], axis=0)
+        ax.plot(times, mean_trace, color=mean_color, lw=mean_lw, label='Mean')
+
+        ax.axvline(0.0, color='k', linestyle='--', alpha=0.6)   # event/stimulus onset
+        ax.set_title(ch_names[ch], fontsize=8)
+        if ch % n_cols == 0:
+            ax.set_ylabel('µV')
+        ax.set_xlim(times[0], times[-1])
+        ax.grid(True, alpha=0.25)
+        if ch == 0:
+            ax.legend(loc='upper right', fontsize=8)
+
+    # Turn off unused axes
+    for ax in axes[n_ch:]:
+        ax.axis('off')
+
+    fig.suptitle("All epochs per channel (overlay) with mean in color", fontsize=12)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
+
+
+# Example usage:
+# If you have edata (n_epochs, n_channels, n_times) and times available:
+# plot_all_epochs_per_channel()
+#
+# Or explicitly:
+plot_all_epochs_per_channel(edata_sources={'edata': edata}, times=times, ch_names=ch_names, sfreq=sfreq)
 
 # =================== Detection of stimulus onset =========================
 
@@ -453,6 +627,305 @@ def realign_epochs_to_stimulus(
     
     return edata_realigned, new_times, valid_epochs
 
+# ---------------------- Plotting stimulus detection on epochs ---------------------
+
+def plot_stimulus_onset_detection(
+    edata_uV,
+    stimulus_onsets,
+    channel_onsets,
+    times,
+    ch_names,
+    sfreq,
+    n_cols=6,
+    figsize_per_col=(3.5, 2.5),
+    show_individual_epochs=True,
+    show_mean=True,
+    mark_color='red',
+    mark_style='o',
+    mark_size=4,
+    verbose=False
+):
+    """
+    Plot all epochs per channel with detected stimulus onset marked.
+    
+    Parameters
+    ----------
+    edata_uV : ndarray
+        Epoch data in microvolts (n_epochs, n_channels, n_times)
+    stimulus_onsets : ndarray
+        Sample index of stimulus onset for each epoch (shape: n_epochs)
+    channel_onsets : ndarray
+        Per-channel onset samples (shape: n_epochs, n_channels)
+    times : ndarray
+        Time vector in seconds (n_times,)
+    ch_names : list
+        Channel names (length n_channels)
+    sfreq : float
+        Sampling frequency in Hz
+    n_cols : int
+        Number of subplot columns
+    figsize_per_col : tuple
+        (width, height) multipliers for figure size
+    show_individual_epochs : bool
+        If True, plot all individual epochs (transparent)
+    show_mean : bool
+        If True, plot mean epoch on top (bold)
+    mark_color : str
+        Color for stimulus onset markers
+    mark_style : str
+        Marker style ('o', 's', 'x', '+', etc.)
+    mark_size : int
+        Size of markers
+    verbose : bool
+        Print diagnostics
+    
+    Returns
+    -------
+    fig : matplotlib figure object
+    """
+    
+    n_epochs, n_channels, n_times = edata_uV.shape
+    
+    if verbose:
+        print(f"Plotting stimulus onset detection:")
+        print(f"  Data shape: {edata_uV.shape}")
+        print(f"  Channels: {n_channels}")
+        print(f"  Epochs: {n_epochs}")
+    
+    # Setup subplot grid
+    n_rows = int(math.ceil(n_channels / n_cols))
+    figsize = (figsize_per_col[0] * n_cols, figsize_per_col[1] * n_rows)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, sharex=True)
+    axes = axes.ravel()
+    
+    # Convert times to milliseconds for better readability
+    times_ms = times * 1000
+    
+    # Plot each channel
+    for ch_idx in range(n_channels):
+        ax = axes[ch_idx]
+        
+        # Plot all individual epochs (light, transparent)
+        if show_individual_epochs:
+            for ep_idx in range(n_epochs):
+                ax.plot(times_ms, edata_uV[ep_idx, ch_idx, :], 
+                       color='C0', alpha=0.15, lw=0.6, zorder=1)
+                
+                # Mark the stimulus onset for this epoch/channel
+                onset_sample = channel_onsets[ep_idx, ch_idx]
+                if 0 <= onset_sample < n_times:
+                    onset_time_ms = times_ms[onset_sample]
+                    onset_amplitude = edata_uV[ep_idx, ch_idx, onset_sample]
+                    
+                    ax.plot(onset_time_ms, onset_amplitude, 
+                           marker=mark_style, color=mark_color, 
+                           markersize=mark_size, alpha=0.4, zorder=2)
+        
+        # Plot mean epoch on top (bold)
+        if show_mean:
+            mean_epoch = np.mean(edata_uV[:, ch_idx, :], axis=0)
+            ax.plot(times_ms, mean_epoch, color='C1', lw=2, label='Mean', zorder=3)
+            
+            # Mark consensus onset on mean
+            consensus_onset_sample = stimulus_onsets[ch_idx] if ch_idx < len(stimulus_onsets) else stimulus_onsets[0]
+            # Actually, use the median consensus
+            consensus_onset_sample = int(np.median(channel_onsets[:, ch_idx]))
+            
+            if 0 <= consensus_onset_sample < n_times:
+                consensus_onset_time_ms = times_ms[consensus_onset_sample]
+                consensus_onset_amplitude = mean_epoch[consensus_onset_sample]
+                
+                ax.plot(consensus_onset_time_ms, consensus_onset_amplitude,
+                       marker=mark_style, color='darkred', markersize=mark_size+2,
+                       markeredgewidth=1.5, markerfacecolor='none', zorder=4,
+                       label='Consensus onset')
+        
+        # Formatting
+        ax.axvline(0, color='k', linestyle='--', alpha=0.6, linewidth=0.8, label='Epoch start (0 ms)')
+        ax.axhline(0, color='gray', linestyle=':', alpha=0.4, linewidth=0.7)
+        ax.set_title(ch_names[ch_idx], fontsize=9, fontweight='bold')
+        
+        if ch_idx % n_cols == 0:
+            ax.set_ylabel('µV', fontsize=8)
+        
+        ax.grid(True, alpha=0.2, linewidth=0.5)
+        ax.set_xlim(times_ms[0], times_ms[-1])
+        
+        # Add legend to first subplot
+        if ch_idx == 0 and show_individual_epochs:
+            ax.legend(loc='upper right', fontsize=7, framealpha=0.9)
+    
+    # Turn off unused axes
+    for ax in axes[n_channels:]:
+        ax.axis('off')
+    
+    # Global formatting
+    fig.text(0.5, 0.02, 'Time (ms)', ha='center', fontsize=10)
+    fig.suptitle('Stimulus Onset Detection per Channel\n(light: individual epochs, bold: mean, markers: detected onsets)',
+                fontsize=12, fontweight='bold', y=0.995)
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.99])
+    
+    return fig
+
+
+def plot_stimulus_onset_statistics(
+    stimulus_onsets,
+    channel_onsets,
+    sfreq,
+    reliability_scores=None,
+    verbose=False
+):
+    """
+    Plot statistics about stimulus onset detection across epochs.
+    
+    Parameters
+    ----------
+    stimulus_onsets : ndarray
+        Consensus onset sample per epoch (n_epochs,)
+    channel_onsets : ndarray
+        Per-channel onsets (n_epochs, n_channels)
+    sfreq : float
+        Sampling frequency
+    reliability_scores : ndarray, optional
+        Reliability scores per epoch
+    verbose : bool
+        Print diagnostics
+    """
+    
+    n_epochs, n_channels = channel_onsets.shape
+    
+    # Convert to milliseconds
+    stimulus_onsets_ms = stimulus_onsets / sfreq * 1000
+    channel_onsets_ms = channel_onsets / sfreq * 1000
+    
+    # Compute statistics per epoch
+    onset_std_per_epoch = np.std(channel_onsets_ms, axis=1)
+    onset_mean_per_epoch = np.mean(channel_onsets_ms, axis=1)
+    onset_range_per_epoch = np.max(channel_onsets_ms, axis=1) - np.min(channel_onsets_ms, axis=1)
+    
+    # Create figure with multiple subplots
+    fig = plt.figure(figsize=(14, 10))
+    gs = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.3)
+    
+    # 1. Distribution of consensus onsets
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.hist(stimulus_onsets_ms, bins=20, color='C0', alpha=0.7, edgecolor='black')
+    ax1.axvline(np.mean(stimulus_onsets_ms), color='red', linestyle='--', lw=2, label=f'Mean: {np.mean(stimulus_onsets_ms):.1f} ms')
+    ax1.set_xlabel('Stimulus Onset (ms)')
+    ax1.set_ylabel('Frequency')
+    ax1.set_title('Distribution of Consensus Onsets')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. Standard deviation of onsets across channels per epoch
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.scatter(range(n_epochs), onset_std_per_epoch, alpha=0.6, s=30, color='C1')
+    ax2.axhline(np.mean(onset_std_per_epoch), color='red', linestyle='--', lw=2, label=f'Mean: {np.mean(onset_std_per_epoch):.2f} ms')
+    ax2.set_xlabel('Epoch Index')
+    ax2.set_ylabel('Std Dev Across Channels (ms)')
+    ax2.set_title('Onset Variability per Epoch')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # 3. Range of onsets per epoch
+    ax3 = fig.add_subplot(gs[0, 2])
+    ax3.scatter(range(n_epochs), onset_range_per_epoch, alpha=0.6, s=30, color='C2')
+    ax3.axhline(np.mean(onset_range_per_epoch), color='red', linestyle='--', lw=2, label=f'Mean: {np.mean(onset_range_per_epoch):.2f} ms')
+    ax3.set_xlabel('Epoch Index')
+    ax3.set_ylabel('Range (ms)')
+    ax3.set_title('Onset Range per Epoch (max - min)')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # 4. Boxplot of onsets per channel
+    ax4 = fig.add_subplot(gs[1, :])
+    bp = ax4.boxplot([channel_onsets_ms[:, ch] for ch in range(n_channels)],
+                     labels=[f'Ch{ch}' for ch in range(n_channels)],
+                     patch_artist=True)
+    for patch in bp['boxes']:
+        patch.set_facecolor('C0')
+        patch.set_alpha(0.7)
+    ax4.set_ylabel('Onset (ms)')
+    ax4.set_title('Stimulus Onset Distribution per Channel')
+    ax4.grid(True, alpha=0.3, axis='y')
+    
+    # 5. Scatter: consensus vs mean across channels
+    ax5 = fig.add_subplot(gs[2, 0])
+    ax5.scatter(onset_mean_per_epoch, stimulus_onsets_ms, alpha=0.6, s=30, color='C3')
+    min_val = min(np.min(onset_mean_per_epoch), np.min(stimulus_onsets_ms))
+    max_val = max(np.max(onset_mean_per_epoch), np.max(stimulus_onsets_ms))
+    ax5.plot([min_val, max_val], [min_val, max_val], 'k--', lw=1, alpha=0.5)
+    ax5.set_xlabel('Mean Onset Across Channels (ms)')
+    ax5.set_ylabel('Consensus Onset (ms)')
+    ax5.set_title('Consensus vs Mean')
+    ax5.grid(True, alpha=0.3)
+    
+    # 6. Reliability scores vs onset variability
+    if reliability_scores is not None:
+        ax6 = fig.add_subplot(gs[2, 1])
+        scatter = ax6.scatter(onset_std_per_epoch, reliability_scores, alpha=0.6, s=30, 
+                             c=reliability_scores, cmap='RdYlGn', vmin=0, vmax=1)
+        ax6.set_xlabel('Onset Std Dev (ms)')
+        ax6.set_ylabel('Reliability Score')
+        ax6.set_title('Reliability vs Onset Variability')
+        plt.colorbar(scatter, ax=ax6, label='Reliability')
+        ax6.grid(True, alpha=0.3)
+    
+    # 7. Reliability score distribution
+    if reliability_scores is not None:
+        ax7 = fig.add_subplot(gs[2, 2])
+        ax7.hist(reliability_scores, bins=20, color='C4', alpha=0.7, edgecolor='black')
+        ax7.axvline(0.5, color='orange', linestyle='--', lw=2, label='Threshold (0.5)')
+        ax7.axvline(np.mean(reliability_scores), color='red', linestyle='--', lw=2, label=f'Mean: {np.mean(reliability_scores):.2f}')
+        ax7.set_xlabel('Reliability Score')
+        ax7.set_ylabel('Frequency')
+        ax7.set_title('Reliability Score Distribution')
+        ax7.legend()
+        ax7.grid(True, alpha=0.3)
+    
+    fig.suptitle('Stimulus Onset Detection Statistics', fontsize=13, fontweight='bold', y=0.995)
+    
+    return fig
+
+
+# ================== USAGE ==================
+
+print("\n" + "="*70)
+print("VISUALIZING STIMULUS ONSET DETECTION")
+print("="*70)
+
+# Plot 1: All epochs with detected onsets marked
+print("\nGenerating plot 1: All epochs with onset markers...")
+fig1 = plot_stimulus_onset_detection(
+    edata_uV,
+    stimulus_onsets,
+    channel_onsets,
+    epochs.times,  # or use epochs.times if plotting original data
+    eeg_labels,
+    sfreq,
+    n_cols=6,
+    show_individual_epochs=True,
+    show_mean=True,
+    mark_color='red',
+    mark_style='o',
+    mark_size=5,
+    verbose=True
+)
+plt.show()
+
+# Plot 2: Statistics about onset detection
+print("\nGenerating plot 2: Onset detection statistics...")
+fig2 = plot_stimulus_onset_statistics(
+    stimulus_onsets,
+    channel_onsets,
+    sfreq,
+    reliability_scores=reliability_scores,
+    verbose=True
+)
+plt.show()
+
+print("\n✓ Plots generated successfully!")
 
 # ================== Detection of stimulus onset ====================================
 
@@ -508,7 +981,7 @@ print("="*50)
 
 # Realign epochs so they start at stimulus onset
 tmin_realigned = 0.0      # Start AT stimulus onset
-tmax_realigned = 1     # 490 ms after stimulus
+tmax_realigned = 0.5     # 490 ms after stimulus
 
 edata_realigned, times_realigned, valid_epochs = realign_epochs_to_stimulus(
     edata_uV,
@@ -589,6 +1062,7 @@ axes = axes.ravel()
 for i in range(n_ch):
     ax = axes[i]
     ax.plot(times_cropped_all, evoked_potential[i], color='C0', lw=1.5)
+    ax.axhline(0, color='k', linestyle='-', alpha=0.4, linewidth=0.8)
     ax.axvline(0.0, color='k', linestyle='--', alpha=0.6, label='Stimulus onset')
     ax.set_title(eeg_labels[i], fontsize=8)
     if i % n_cols == 0:
@@ -634,6 +1108,7 @@ plt.tight_layout()
 plt.show()
 
 # ================== SAVE RESULTS ==================
+"""
 print("\n" + "="*50)
 print("SAVING RESULTS")
 print("="*50)
@@ -649,7 +1124,7 @@ print(f"✓ Saved to {output_dir}/")
 print(f"  - evoked_potential.npy: shape {evoked_potential.shape}")
 print(f"  - edata_good.npy: shape {edata_good.shape}")
 print(f"  - times_cropped.npy: shape {times_cropped_all.shape}")
-
+"""
 # Option 2: Create a summary report
 summary = {
     'total_epochs': len(reliability_scores),
@@ -668,10 +1143,10 @@ summary = {
 
 # ================== GROUP AVERAGING ==================
 print("\n" + "="*50)
-print("AVERAGING EPOCHS IN GROUPS OF 10")
+print("AVERAGING EPOCHS IN GROUPS OF 40")
 print("="*50)
 
-group_size = 10
+group_size = 15
 n_good_epochs = edata_good.shape[0]
 n_groups = int(np.floor(n_good_epochs / group_size))
 remainder = n_good_epochs % group_size
@@ -745,6 +1220,7 @@ for group_idx in range(len(grouped_averages)):
     for ch_idx in range(n_channels):
         ax = axes[ch_idx]
         ax.plot(times_cropped_all, group_mean[ch_idx], color='C0', lw=1.5)
+        ax.axhline(0, color='k', linestyle='-', alpha=0.4, linewidth=0.8)
         ax.axvline(0.0, color='k', linestyle='--', alpha=0.6)
         ax.set_title(eeg_labels[ch_idx], fontsize=8)
         if ch_idx % n_cols == 0:
@@ -758,7 +1234,7 @@ for group_idx in range(len(grouped_averages)):
     
     # Create informative title
     title = (f"Group {info['group_num']}: Epochs {info['start_epoch']}-{info['end_epoch']-1} "
-             f"(n={info['n_epochs']}, reliability={info['mean_reliability']:.3f})")
+             f"(n={info['n_epochs']})")
     
     fig.suptitle(title, fontsize=12, fontweight='bold')
     plt.tight_layout(rect=[0, 0, 1, 0.96])
