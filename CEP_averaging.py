@@ -11,9 +11,12 @@ import mplcursors
 import mne
 import math
 import os
+from typing import Optional, Union, Tuple, List, Dict, Any
+from matplotlib.colors import to_rgb
+import pandas as pd
 
 # Specify the full path to your EDF file
-file_path = r"C:\Users\msedo\Documents\Cerebelo\Chimula Mark\13.14_stim.edf"  # Change this to your file path
+file_path = r"C:\Users\marti\Documents\HSJD\Cerebellum Evoked Potentials\Chimula Mark\13.14_stim.edf"  # Change this to your file path
 
 raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
 raw.drop_channels( ['Chin+','ECG+','DI+','DD+','RONQ+','CAN+','TER+','PCO2+','EtCO+','Pos+','Tor+','Abd+','TIBI+','TIBD+','thor+','abdo+','PULS+','BEAT+','SpO2+','MKR+'])
@@ -132,26 +135,141 @@ print(f"Event ID mapping: {event_id}")
 epochs = mne.Epochs(raw_filtered, events, event_id=event_id,
                     tmin=epoch_tmin, tmax=epoch_tmax, baseline=None, preload=True, verbose=False)
 
-
 # epoch data shape: (n_epochs, n_channels, n_times)
 edata = epochs.get_data()
 n_epochs, n_channels, n_times = edata.shape
 epoch_duration_s = (n_times - 1) / sfreq  # approximate
 print(f"Epochs shape: {edata.shape} (n_epochs, n_channels, n_times). epoch_duration ≈ {epoch_duration_s:.3f} s")
 
-
-
 # If you want epoch data in microvolts (µV):
 edata_uV = edata * 1e6
 
+# ====================== Apply montage =======================================
+
+std = mne.channels.make_standard_montage('standard_1020')
+std_pos = std.get_positions()['ch_pos']  # map like 'F3' -> (x,y,z)
+
+ch_pos = {}
+missing = []
+for ch in epochs.ch_names:
+    std_name = ch.replace('EEG ', '').strip()   # "EEG F3" -> "F3"
+    if std_name in std_pos:
+        ch_pos[ch] = std_pos[std_name]
+    else:
+        missing.append(ch)
+
+print("Matched channels:", list(ch_pos.keys()))
+if missing:
+    print("WARNING - channels not found in standard_1020:", missing)
+
+if len(ch_pos) == 0:
+    raise RuntimeError("No channels matched the standard 10-20 names. Check channel labels.")
+
+montage_subset = mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame='head')
+
+# 2) Attach montage to epochs (and to evoked if already created)
+epochs.set_montage(montage_subset)
+
+mne.viz.plot_sensors(epochs.info, show_names=True)
+plt.title('Sensor positions (mapped to standard 10-20 where available)')
+plt.show()
+
+# PSD
+epochs.average().compute_psd(
+    method='welch', 
+    fmin=0, 
+    fmax=200).plot()
+
+# TOPOMAPS
+times_top = np.arange(0.0, 0.05, 0.005)
+epochs.average().plot_topomap(times_top)
+
+mne.viz.plot_epochs_image(
+    epochs,
+    sigma=0.5,
+    vmin=-250,
+    vmax=250,
+    show=True,
+)
+
+
 # Quick checks / visualization
 #  - show average evoked across epochs for first event type (if multiple)
-first_ev_key = list(event_id.keys())[0]
-print(f"Plotting average for event: {first_ev_key}")
-evoked = epochs[first_ev_key].average()
-evoked.plot(spatial_colors=True)   # interactive MNE plot
+epochs.average().plot(spatial_colors=True)   # interactive MNE plot
 
+# Plotting mean signal for all channels
+evoked = epochs.average()
 
+# use evoked.data (n_ch x n_times) in Volts; convert to µV for plotting
+data_uV = evoked.data * 1e6
+times = evoked.times
+ch_names = evoked.ch_names
+n_ch = len(ch_names)
+
+# colours for channels
+cmap = plt.get_cmap('tab20')
+colors = cmap(np.linspace(0, 1, n_ch))
+
+# Create a figure and reserve room on the right for the inset
+fig = plt.figure(figsize=(11, 5))
+
+# Main axes: left, bottom, width, height (figure coords)
+ax = fig.add_axes([0.06, 0.12, 0.72, 0.82])   # make width smaller than full figure so inset fits
+lines = []
+for i in range(n_ch):
+    ln, = ax.plot(times, data_uV[i], color=colors[i], lw=1.2)
+    lines.append(ln)
+
+ax.set_xlim(times[0], times[-1])
+ax.axvline(0.0, color='k', linestyle='--', alpha=0.6)
+ax.axhline(0.0, color='k', linestyle='-', alpha=0.4)
+ax.set_xlabel('Time (s)')
+ax.set_ylabel('µV')
+ax.set_title(f'EEG ({n_ch} channels) — mean across {len(epochs):d} epochs')
+
+# Inset axes for head (positioned to the right, outside main trace area)
+inset_ax = fig.add_axes([0.80, 0.62, 0.18, 0.30])  # tweak numbers to refine position & size
+inset_ax.set_xticks([])
+inset_ax.set_yticks([])
+inset_ax.set_aspect('equal')
+
+# Overlay channel NAMES at 2D layout positions, colored to match the traces
+layout = mne.find_layout(evoked.info)
+pos = np.asarray(layout.pos)   # may be (N,2) or (N,3)
+layout_names = list(layout.names)
+name_to_idx = {name: idx for idx, name in enumerate(layout_names)}
+
+for i, ch in enumerate(ch_names):
+    # find matching index in the layout (try exact, then stripped version)
+    idx = name_to_idx.get(ch, name_to_idx.get(ch.replace('EEG ', '').strip(), None))
+    if idx is None:
+        # channel missing from layout (optional: print or skip)
+        # print(f"Warning: channel {ch} not found in layout; skipping label.")
+        continue
+
+    coords = np.asarray(pos[idx])
+    x, y = float(coords[0]), float(coords[1])  # robust to 2D/3D coords
+
+    # plot a small colored dot (optional) so text stands out against head outline
+    inset_ax.scatter(x, y, color=colors[i], edgecolor='k', s=30, zorder=11)
+
+    # channel label (remove "EEG " prefix for compactness)
+    label = ch.replace('EEG ', '').strip()
+
+    # draw the text label in the same color as the trace
+    # optional bbox can be used for readability; remove bbox=dict(...) if you prefer plain text
+    inset_ax.text(x, y + 0.025, label, color=colors[i], fontsize=8,
+                  ha='center', va='bottom', zorder=12,
+                  bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.6, edgecolor='none'))
+
+inset_ax.set_title('Channels', fontsize=9)
+inset_ax.autoscale(False)  # keep inset fixed
+
+# optionally add a legend of channel names + colors (placed between main axes and inset)
+# fig.legend(lines, [ch.replace('EEG ', '') for ch in ch_names], loc='upper left',
+#            bbox_to_anchor=(0.74, 0.96), fontsize='small', frameon=False, ncol=1)
+
+plt.show()
 
 # ----------------- Per channel average ------------------------------
 
@@ -356,644 +474,192 @@ def plot_all_epochs_per_channel(
     plt.show()
 
 
-# Example usage:
-# If you have edata (n_epochs, n_channels, n_times) and times available:
-# plot_all_epochs_per_channel()
-#
-# Or explicitly:
 plot_all_epochs_per_channel(edata_sources={'edata': edata}, times=times, ch_names=ch_names, sfreq=sfreq)
 
-# =================== Detection of stimulus onset =========================
 
-def find_stimulus_onset_per_epoch_v2(
-    edata_uV,
-    sfreq,
-    ch_names,
-    method='template_matching',
-    use_best_channels=True,
-    num_best_channels=5,
-    template_duration_ms=1000,
-    verbose=False
-):
+
+def _lighten_color(color, amount=0.6):
+    """Return a lighter color by blending `color` with white.
+    amount in [0,1]: 0 -> original color, 1 -> white"""
+    try:
+        r, g, b = to_rgb(color)
+    except Exception:
+        r, g, b = color
+    r = r + (1.0 - r) * amount
+    g = g + (1.0 - g) * amount
+    b = b + (1.0 - b) * amount
+    return (r, g, b)
+
+
+def plot_channel_means_with_envelope_same_color_ms(
+    edata_sources: Optional[Dict[str, Any]] = None,
+    times: Optional[np.ndarray] = None,
+    ch_names: Optional[list] = None,
+    sfreq: Optional[float] = None,
+    n_cols: int = 6,
+    mean_color='C1',
+    mean_lw: float = 1.6,
+    envelope_alpha: float = 0.35,      # slightly darker than before
+    envelope_kind: str = 'std',        # 'std' or 'sem'
+    envelope_lighten_frac: float = 0.50,  # less lightening => darker envelope
+    vmax_abs_convert: float = 1e-2,
+    figsize_per_col: tuple = (3, 2.2),
+    return_fig_ax: bool = False
+) -> Optional[Tuple[plt.Figure, np.ndarray]]:
     """
-    Improved stimulus onset detection using:
-    1. Channel selection (use only channels with strong stimulus response)
-    2. Template matching or cross-correlation based detection
-    3. More robust consensus across channels
-    
-    Parameters
-    ----------
-    edata_uV : ndarray
-        Epoch data in microvolts (n_epochs, n_channels, n_times)
-    sfreq : float
-        Sampling frequency in Hz
-    ch_names : list
-        Channel names
-    method : str
-        'template_matching' or 'amplitude_envelope'
-    use_best_channels : bool
-        If True, automatically select channels with strongest stimulus response
-    num_best_channels : int
-        Number of best channels to use for consensus
-    template_duration_ms : float
-        Duration of stimulus artifact to analyze (ms)
-    verbose : bool
-        Print diagnostics
-    
-    Returns
-    -------
-    stimulus_onsets : ndarray
-        Sample index of stimulus onset for each epoch
-    reliability_scores : ndarray
-        Confidence score (0-1) for each epoch's detection
+    Plot means +/- envelope for each channel, ALL subplots using the same color,
+    show x axis time (ms) and make envelope a bit darker.
+
+    See docstring in the previous version for parameter behavior and edata discovery.
     """
-    
-    from scipy.signal import correlate, hilbert
-    from scipy.ndimage import uniform_filter1d
-    
-    n_epochs, n_channels, n_times = edata_uV.shape
-    template_samples = int(np.ceil(template_duration_ms * sfreq / 1000))
-    
-    stimulus_onsets = np.zeros(n_epochs, dtype=int)
-    reliability_scores = np.zeros(n_epochs)
-    channel_onsets = np.zeros((n_epochs, n_channels), dtype=int)
-    
-    if verbose:
-        print(f"Stimulus onset detection (v2):")
-        print(f"  Method: {method}")
-        print(f"  Using best {num_best_channels} channels: {use_best_channels}")
-    
-    # Step 1: Identify best channels (strongest stimulus response)
-    if use_best_channels:
-        if verbose:
-            print(f"\n  Selecting best channels...")
-        
-        # Calculate signal energy/variance in first 100ms (where stimulus should be)
-        early_window = int(np.ceil(0.1 * sfreq))  # first 100ms
-        channel_energies = np.zeros(n_channels)
-        
-        for ch in range(n_channels):
-            # RMS across all epochs in early window
-            channel_energies[ch] = np.sqrt(np.mean(edata_uV[:, ch, :early_window]**2))
-        
-        # Sort and select top channels
-        best_ch_indices = np.argsort(channel_energies)[-num_best_channels:]
-        best_ch_indices = np.sort(best_ch_indices)
-        
-        if verbose:
-            for idx in best_ch_indices:
-                print(f"    {ch_names[idx]}: energy={channel_energies[idx]:.1f} µV")
+    # --- locate epoch data ---
+    edata = None
+    if edata_sources is None:
+        candidates = ['edata', 'edata_uV', 'edata_good', 'edata_baselined',
+                      'edata_cropped_all', 'epochs_data']
+        g = globals()
+        for name in candidates:
+            if name in g and g[name] is not None:
+                arr = g[name]
+                if isinstance(arr, np.ndarray) and arr.ndim == 3:
+                    edata = arr
+                    break
+        if edata is None and 'epochs' in g:
+            try:
+                edata = g['epochs'].get_data()
+            except Exception:
+                edata = None
     else:
-        best_ch_indices = np.arange(n_channels)
-    
-    # Step 2: Process each epoch
-    for epoch_idx in range(n_epochs):
-        epoch_data = edata_uV[epoch_idx, :, :]
-        
-        # Get detections from best channels
-        onsets_this_epoch = []
-        correlations_this_epoch = []
-        
-        for ch_idx in best_ch_indices:
-            signal = epoch_data[ch_idx, :].astype(np.float64)
-            
-            if method == 'amplitude_envelope':
-                # Use analytic signal (Hilbert transform)
-                analytic_signal = np.abs(hilbert(signal))
-                
-                # Smooth and find onset as first significant rise
-                window = int(np.ceil(2 * sfreq / 1000))  # 2ms smoothing
-                if window > 1:
-                    smoothed = uniform_filter1d(analytic_signal, size=window)
-                else:
-                    smoothed = analytic_signal
-                
-                # Find onset: first crossing of 40th percentile
-                threshold = np.percentile(smoothed, 40)
-                candidates = np.where(smoothed > threshold)[0]
-                
-                if len(candidates) > 0:
-                    onset = candidates[0]
-                else:
-                    onset = np.argmax(analytic_signal)
-                
-                correlation = np.max(analytic_signal[:template_samples]) / (np.mean(analytic_signal) + 1e-10)
-            
-            elif method == 'template_matching':
-                # Create a high-pass filtered version to emphasize the spike
-                from scipy.signal import butter, sosfilt
-                
-                # Design a high-pass filter at 300 Hz (assuming stimulus is very sharp)
-                sos = butter(4, 300, 'hp', fs=sfreq, output='sos')
-                signal_hp = sosfilt(sos, signal)
-                
-                # Find the maximum of the first derivative (steepest rising edge)
-                gradient = np.gradient(signal_hp)
-                
-                # Smooth gradient with 2ms window
-                window = max(1, int(np.ceil(2 * sfreq / 1000)))
-                kernel = np.ones(window) / window
-                gradient_smooth = np.convolve(gradient, kernel, mode='same')
-                
-                # Find onset: maximum positive gradient in first 100ms
-                search_window = min(int(0.1 * sfreq), n_times)
-                onset = np.argmax(gradient_smooth[:search_window])
-                
-                # Calculate correlation as signal peak in first template window
-                correlation = np.max(np.abs(signal_hp[:template_samples])) / (np.std(signal_hp) + 1e-10)
-            
-            onsets_this_epoch.append(onset)
-            correlations_this_epoch.append(correlation)
-            channel_onsets[epoch_idx, ch_idx] = onset
-        
-        # Consensus: use weighted median (channels with higher correlation get more weight)
-        correlations_array = np.array(correlations_this_epoch)
-        onsets_array = np.array(onsets_this_epoch)
-        
-        # Normalize correlations to 0-1 range as weights
-        weights = (correlations_array - np.min(correlations_array)) / (np.max(correlations_array) - np.min(correlations_array) + 1e-10)
-        
-        # Weighted median
-        sorted_idx = np.argsort(onsets_array)
-        sorted_onsets = onsets_array[sorted_idx]
-        sorted_weights = weights[sorted_idx]
-        cumsum_weights = np.cumsum(sorted_weights)
-        median_weight = cumsum_weights[-1] / 2
-        median_idx = np.searchsorted(cumsum_weights, median_weight)
-        median_onset = sorted_onsets[median_idx]
-        
-        stimulus_onsets[epoch_idx] = int(median_onset)
-        
-        # Reliability: inverse of normalized std dev of detections
-        onset_std = np.std(onsets_array)
-        reliability = np.exp(-onset_std / (np.mean(onsets_array) + 1e-10))
-        reliability_scores[epoch_idx] = reliability
-        
-        if verbose and epoch_idx < 5:
-            print(f"\n  Epoch {epoch_idx}:")
-            print(f"    Channel onsets: {onsets_array} samples")
-            print(f"    Consensus: {int(median_onset)} samples ({median_onset/sfreq*1000:.2f} ms)")
-            print(f"    Reliability: {reliability:.2f}")
-    
-    if verbose:
-        print(f"\n✓ Detection complete:")
-        print(f"  Mean reliability: {np.mean(reliability_scores):.3f}")
-        print(f"  Low reliability epochs (<0.5): {np.sum(reliability_scores < 0.5)}")
-    
-    return stimulus_onsets, reliability_scores, channel_onsets
+        for name, arr in edata_sources.items():
+            if isinstance(arr, np.ndarray) and arr.ndim == 3:
+                edata = arr
+                break
 
+    if edata is None:
+        raise RuntimeError("No epoch data found. Provide edata (n_epochs,n_ch,n_times) or an epochs object.")
 
-# ==================== Realign Epochs to stimulus onset =======================
+    n_epochs, n_ch, n_times = edata.shape
 
-def realign_epochs_to_stimulus(
-    edata_uV,
-    stimulus_onsets,
-    sfreq,
-    tmin_new=-0.01,
-    tmax_new=0.49,
-    verbose=False
-):
-    """
-    Realign epochs to stimulus onset and crop to desired time window.
-    
-    Parameters
-    ----------
-    edata_uV : ndarray
-        Original epoch data in microvolts (n_epochs, n_channels, n_times)
-    stimulus_onsets : ndarray
-        Sample index of stimulus onset for each epoch (shape: n_epochs)
-    sfreq : float
-        Sampling frequency in Hz
-    tmin_new : float
-        New epoch start time relative to stimulus onset (in seconds)
-    tmax_new : float
-        New epoch end time relative to stimulus onset (in seconds)
-    verbose : bool
-        Print diagnostic information
-    
-    Returns
-    -------
-    edata_realigned : ndarray
-        Realigned epoch data with potentially different time axis
-    new_times : ndarray
-        Time vector for realigned epochs (relative to stimulus onset)
-    valid_epochs : ndarray
-        Boolean array indicating which epochs could be fully realigned
-        (some may be truncated at the edges)
-    """
-    
-    n_epochs, n_channels, n_times = edata_uV.shape
-    
-    # Calculate new epoch length in samples
-    tmin_samples = int(np.round(tmin_new * sfreq))
-    tmax_samples = int(np.round(tmax_new * sfreq))
-    new_n_times = tmax_samples - tmin_samples + 1
-    
-    edata_realigned = np.full((n_epochs, n_channels, new_n_times), np.nan, dtype=edata_uV.dtype)
-    valid_epochs = np.ones(n_epochs, dtype=bool)
-    
-    if verbose:
-        print(f"\nRealigning epochs to stimulus onset:")
-        print(f"  New epoch window: [{tmin_new:.4f}, {tmax_new:.4f}] s")
-        print(f"  New epoch samples: {new_n_times}")
-    
-    for epoch_idx in range(n_epochs):
-        stimulus_sample = stimulus_onsets[epoch_idx]
-        
-        # Calculate sample indices in the original epoch
-        start_sample = stimulus_sample + tmin_samples
-        end_sample = stimulus_sample + tmax_samples
-        
-        # Check if the new window is within the original epoch bounds
-        if start_sample < 0 or end_sample >= n_times:
-            valid_epochs[epoch_idx] = False
-            if verbose and epoch_idx < 3:  # Show first few problematic epochs
-                print(f"  Epoch {epoch_idx}: TRUNCATED (stim @ {stimulus_sample}, range [{start_sample}, {end_sample}])")
-        
-        # Extract and realign (handle edge cases with NaN padding)
-        src_start = max(0, start_sample)
-        src_end = min(n_times, end_sample + 1)
-        dst_start = max(0, -start_sample)
-        dst_end = new_n_times - max(0, end_sample - n_times + 1)
-        
-        edata_realigned[epoch_idx, :, dst_start:dst_end] = edata_uV[epoch_idx, :, src_start:src_end]
-    
-    # Generate time vector relative to stimulus onset
-    new_times = np.arange(new_n_times) / sfreq + tmin_new
-    
-    if verbose:
-        n_valid = np.sum(valid_epochs)
-        print(f"  Valid epochs: {n_valid}/{n_epochs}")
-    
-    return edata_realigned, new_times, valid_epochs
+    # --- times ---
+    if times is None:
+        g = globals()
+        if 'times_cropped_all' in g:
+            times = g['times_cropped_all']
+        elif 'times' in g:
+            times = g['times']
+        elif 'epochs' in g:
+            try:
+                times = g['epochs'].times
+            except Exception:
+                times = None
+        if times is None:
+            if sfreq is None:
+                if 'epochs' in g and hasattr(g['epochs'], 'info'):
+                    sfreq = g['epochs'].info.get('sfreq', None)
+            if sfreq is None:
+                raise RuntimeError("No time vector available and sfreq not provided.")
+            times = np.arange(n_times) / float(sfreq)
 
-# ---------------------- Plotting stimulus detection on epochs ---------------------
+    times = np.asarray(times)
+    # If times look like seconds (max reasonably small) convert to ms; if already >1000 assume ms
+    if np.nanmax(np.abs(times)) <= 1000:
+        times_ms = times * 1000.0
+    else:
+        times_ms = times.copy()
 
-def plot_stimulus_onset_detection(
-    edata_uV,
-    stimulus_onsets,
-    channel_onsets,
-    times,
-    ch_names,
-    sfreq,
-    n_cols=6,
-    figsize_per_col=(3.5, 2.5),
-    show_individual_epochs=True,
-    show_mean=True,
-    mark_color='red',
-    mark_style='o',
-    mark_size=4,
-    verbose=False
-):
-    """
-    Plot all epochs per channel with detected stimulus onset marked.
-    
-    Parameters
-    ----------
-    edata_uV : ndarray
-        Epoch data in microvolts (n_epochs, n_channels, n_times)
-    stimulus_onsets : ndarray
-        Sample index of stimulus onset for each epoch (shape: n_epochs)
-    channel_onsets : ndarray
-        Per-channel onset samples (shape: n_epochs, n_channels)
-    times : ndarray
-        Time vector in seconds (n_times,)
-    ch_names : list
-        Channel names (length n_channels)
-    sfreq : float
-        Sampling frequency in Hz
-    n_cols : int
-        Number of subplot columns
-    figsize_per_col : tuple
-        (width, height) multipliers for figure size
-    show_individual_epochs : bool
-        If True, plot all individual epochs (transparent)
-    show_mean : bool
-        If True, plot mean epoch on top (bold)
-    mark_color : str
-        Color for stimulus onset markers
-    mark_style : str
-        Marker style ('o', 's', 'x', '+', etc.)
-    mark_size : int
-        Size of markers
-    verbose : bool
-        Print diagnostics
-    
-    Returns
-    -------
-    fig : matplotlib figure object
-    """
-    
-    n_epochs, n_channels, n_times = edata_uV.shape
-    
-    if verbose:
-        print(f"Plotting stimulus onset detection:")
-        print(f"  Data shape: {edata_uV.shape}")
-        print(f"  Channels: {n_channels}")
-        print(f"  Epochs: {n_epochs}")
-    
-    # Setup subplot grid
-    n_rows = int(math.ceil(n_channels / n_cols))
+    # --- channel names ---
+    if ch_names is None:
+        g = globals()
+        if 'epochs' in g:
+            try:
+                ch_names = list(g['epochs'].ch_names)
+            except Exception:
+                ch_names = None
+        if ch_names is None:
+            ch_names = [f"ch{i}" for i in range(n_ch)]
+    assert len(ch_names) == n_ch, f"Channel name count ({len(ch_names)}) != data channels ({n_ch})"
+
+    # --- units: convert to µV if necessary ---
+    if np.nanmax(np.abs(edata)) < vmax_abs_convert:
+        edata_uV = edata * 1e6
+    else:
+        edata_uV = edata.copy()
+
+    # --- colors: same color for all channels; envelope is lighter (but darker than before) ---
+    mean_color_rgb = to_rgb(mean_color)
+    envelope_color = _lighten_color(mean_color_rgb, amount=envelope_lighten_frac)
+
+    # --- figure & axes ---
+    n_rows = int(math.ceil(n_ch / n_cols))
     figsize = (figsize_per_col[0] * n_cols, figsize_per_col[1] * n_rows)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, sharex=True)
-    axes = axes.ravel()
-    
-    # Convert times to milliseconds for better readability
-    times_ms = times * 1000
-    
-    # Plot each channel
-    for ch_idx in range(n_channels):
-        ax = axes[ch_idx]
-        
-        # Plot all individual epochs (light, transparent)
-        if show_individual_epochs:
-            for ep_idx in range(n_epochs):
-                ax.plot(times_ms, edata_uV[ep_idx, ch_idx, :], 
-                       color='C0', alpha=0.15, lw=0.6, zorder=1)
-                
-                # Mark the stimulus onset for this epoch/channel
-                onset_sample = channel_onsets[ep_idx, ch_idx]
-                if 0 <= onset_sample < n_times:
-                    onset_time_ms = times_ms[onset_sample]
-                    onset_amplitude = edata_uV[ep_idx, ch_idx, onset_sample]
-                    
-                    ax.plot(onset_time_ms, onset_amplitude, 
-                           marker=mark_style, color=mark_color, 
-                           markersize=mark_size, alpha=0.4, zorder=2)
-        
-        # Plot mean epoch on top (bold)
-        if show_mean:
-            mean_epoch = np.mean(edata_uV[:, ch_idx, :], axis=0)
-            ax.plot(times_ms, mean_epoch, color='C1', lw=2, label='Mean', zorder=3)
-            
-            # Mark consensus onset on mean
-            consensus_onset_sample = stimulus_onsets[ch_idx] if ch_idx < len(stimulus_onsets) else stimulus_onsets[0]
-            # Actually, use the median consensus
-            consensus_onset_sample = int(np.median(channel_onsets[:, ch_idx]))
-            
-            if 0 <= consensus_onset_sample < n_times:
-                consensus_onset_time_ms = times_ms[consensus_onset_sample]
-                consensus_onset_amplitude = mean_epoch[consensus_onset_sample]
-                
-                ax.plot(consensus_onset_time_ms, consensus_onset_amplitude,
-                       marker=mark_style, color='darkred', markersize=mark_size+2,
-                       markeredgewidth=1.5, markerfacecolor='none', zorder=4,
-                       label='Consensus onset')
-        
-        # Formatting
-        ax.axvline(0, color='k', linestyle='--', alpha=0.6, linewidth=0.8, label='Epoch start (0 ms)')
-        ax.axhline(0, color='gray', linestyle=':', alpha=0.4, linewidth=0.7)
-        ax.set_title(ch_names[ch_idx], fontsize=9, fontweight='bold')
-        
-        if ch_idx % n_cols == 0:
-            ax.set_ylabel('µV', fontsize=8)
-        
-        ax.grid(True, alpha=0.2, linewidth=0.5)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, sharex=False)
+    axes = np.array(axes).reshape(-1)
+
+    # Pre-compute xticks for ms axis (same ticks for all subplots)
+    n_xticks = 4
+    xticks = np.linspace(times_ms[0], times_ms[-1], n_xticks)
+    xtick_labels = [f"{int(x)}" for x in xticks]
+
+    for ch in range(n_ch):
+        ax = axes[ch]
+
+        # compute mean and envelope
+        mean_trace = np.nanmean(edata_uV[:, ch, :], axis=0)
+        std_trace = np.nanstd(edata_uV[:, ch, :], axis=0)
+        if envelope_kind == 'sem':
+            valid_counts = np.sum(~np.isnan(edata_uV[:, ch, :]), axis=0)
+            sem = np.zeros_like(std_trace)
+            mask = valid_counts > 0
+            sem[mask] = std_trace[mask] / np.sqrt(valid_counts[mask])
+            lower = mean_trace - sem
+            upper = mean_trace + sem
+        else:
+            lower = mean_trace - std_trace
+            upper = mean_trace + std_trace
+
+        # plot shaded envelope (lightened, but darker than before) and mean line (solid)
+        ax.fill_between(times_ms, lower, upper, color=envelope_color, alpha=envelope_alpha, linewidth=0)
+        ax.plot(times_ms, mean_trace, color=mean_color_rgb, lw=mean_lw)
+
+        ax.axvline(0.0, color='k', linestyle='--', alpha=0.6)
+        ax.set_title(ch_names[ch], fontsize=8)
+
+        # show x axis values (ms) on every subplot, as requested
+        ax.set_xlabel('Time (ms)')
+        ax.set_xticks(xticks)
+        ax.set_xticklabels(xtick_labels, fontsize=8)
+
+        if ch % n_cols == 0:
+            ax.set_ylabel('µV')
         ax.set_xlim(times_ms[0], times_ms[-1])
-        
-        # Add legend to first subplot
-        if ch_idx == 0 and show_individual_epochs:
-            ax.legend(loc='upper right', fontsize=7, framealpha=0.9)
-    
-    # Turn off unused axes
-    for ax in axes[n_channels:]:
+        ax.grid(True, alpha=0.2)
+
+    # turn off unused axes
+    for ax in axes[n_ch:]:
         ax.axis('off')
-    
-    # Global formatting
-    fig.text(0.5, 0.02, 'Time (ms)', ha='center', fontsize=10)
-    fig.suptitle('Stimulus Onset Detection per Channel\n(light: individual epochs, bold: mean, markers: detected onsets)',
-                fontsize=12, fontweight='bold', y=0.995)
-    
-    plt.tight_layout(rect=[0, 0.03, 1, 0.99])
-    
-    return fig
 
+    fig.suptitle("Channel means ± envelope (same color for all channels)", fontsize=12)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
 
-def plot_stimulus_onset_statistics(
-    stimulus_onsets,
-    channel_onsets,
-    sfreq,
-    reliability_scores=None,
-    verbose=False
-):
-    """
-    Plot statistics about stimulus onset detection across epochs.
-    
-    Parameters
-    ----------
-    stimulus_onsets : ndarray
-        Consensus onset sample per epoch (n_epochs,)
-    channel_onsets : ndarray
-        Per-channel onsets (n_epochs, n_channels)
-    sfreq : float
-        Sampling frequency
-    reliability_scores : ndarray, optional
-        Reliability scores per epoch
-    verbose : bool
-        Print diagnostics
-    """
-    
-    n_epochs, n_channels = channel_onsets.shape
-    
-    # Convert to milliseconds
-    stimulus_onsets_ms = stimulus_onsets / sfreq * 1000
-    channel_onsets_ms = channel_onsets / sfreq * 1000
-    
-    # Compute statistics per epoch
-    onset_std_per_epoch = np.std(channel_onsets_ms, axis=1)
-    onset_mean_per_epoch = np.mean(channel_onsets_ms, axis=1)
-    onset_range_per_epoch = np.max(channel_onsets_ms, axis=1) - np.min(channel_onsets_ms, axis=1)
-    
-    # Create figure with multiple subplots
-    fig = plt.figure(figsize=(14, 10))
-    gs = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.3)
-    
-    # 1. Distribution of consensus onsets
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.hist(stimulus_onsets_ms, bins=20, color='C0', alpha=0.7, edgecolor='black')
-    ax1.axvline(np.mean(stimulus_onsets_ms), color='red', linestyle='--', lw=2, label=f'Mean: {np.mean(stimulus_onsets_ms):.1f} ms')
-    ax1.set_xlabel('Stimulus Onset (ms)')
-    ax1.set_ylabel('Frequency')
-    ax1.set_title('Distribution of Consensus Onsets')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # 2. Standard deviation of onsets across channels per epoch
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax2.scatter(range(n_epochs), onset_std_per_epoch, alpha=0.6, s=30, color='C1')
-    ax2.axhline(np.mean(onset_std_per_epoch), color='red', linestyle='--', lw=2, label=f'Mean: {np.mean(onset_std_per_epoch):.2f} ms')
-    ax2.set_xlabel('Epoch Index')
-    ax2.set_ylabel('Std Dev Across Channels (ms)')
-    ax2.set_title('Onset Variability per Epoch')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    
-    # 3. Range of onsets per epoch
-    ax3 = fig.add_subplot(gs[0, 2])
-    ax3.scatter(range(n_epochs), onset_range_per_epoch, alpha=0.6, s=30, color='C2')
-    ax3.axhline(np.mean(onset_range_per_epoch), color='red', linestyle='--', lw=2, label=f'Mean: {np.mean(onset_range_per_epoch):.2f} ms')
-    ax3.set_xlabel('Epoch Index')
-    ax3.set_ylabel('Range (ms)')
-    ax3.set_title('Onset Range per Epoch (max - min)')
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
-    
-    # 4. Boxplot of onsets per channel
-    ax4 = fig.add_subplot(gs[1, :])
-    bp = ax4.boxplot([channel_onsets_ms[:, ch] for ch in range(n_channels)],
-                     labels=[f'Ch{ch}' for ch in range(n_channels)],
-                     patch_artist=True)
-    for patch in bp['boxes']:
-        patch.set_facecolor('C0')
-        patch.set_alpha(0.7)
-    ax4.set_ylabel('Onset (ms)')
-    ax4.set_title('Stimulus Onset Distribution per Channel')
-    ax4.grid(True, alpha=0.3, axis='y')
-    
-    # 5. Scatter: consensus vs mean across channels
-    ax5 = fig.add_subplot(gs[2, 0])
-    ax5.scatter(onset_mean_per_epoch, stimulus_onsets_ms, alpha=0.6, s=30, color='C3')
-    min_val = min(np.min(onset_mean_per_epoch), np.min(stimulus_onsets_ms))
-    max_val = max(np.max(onset_mean_per_epoch), np.max(stimulus_onsets_ms))
-    ax5.plot([min_val, max_val], [min_val, max_val], 'k--', lw=1, alpha=0.5)
-    ax5.set_xlabel('Mean Onset Across Channels (ms)')
-    ax5.set_ylabel('Consensus Onset (ms)')
-    ax5.set_title('Consensus vs Mean')
-    ax5.grid(True, alpha=0.3)
-    
-    # 6. Reliability scores vs onset variability
-    if reliability_scores is not None:
-        ax6 = fig.add_subplot(gs[2, 1])
-        scatter = ax6.scatter(onset_std_per_epoch, reliability_scores, alpha=0.6, s=30, 
-                             c=reliability_scores, cmap='RdYlGn', vmin=0, vmax=1)
-        ax6.set_xlabel('Onset Std Dev (ms)')
-        ax6.set_ylabel('Reliability Score')
-        ax6.set_title('Reliability vs Onset Variability')
-        plt.colorbar(scatter, ax=ax6, label='Reliability')
-        ax6.grid(True, alpha=0.3)
-    
-    # 7. Reliability score distribution
-    if reliability_scores is not None:
-        ax7 = fig.add_subplot(gs[2, 2])
-        ax7.hist(reliability_scores, bins=20, color='C4', alpha=0.7, edgecolor='black')
-        ax7.axvline(0.5, color='orange', linestyle='--', lw=2, label='Threshold (0.5)')
-        ax7.axvline(np.mean(reliability_scores), color='red', linestyle='--', lw=2, label=f'Mean: {np.mean(reliability_scores):.2f}')
-        ax7.set_xlabel('Reliability Score')
-        ax7.set_ylabel('Frequency')
-        ax7.set_title('Reliability Score Distribution')
-        ax7.legend()
-        ax7.grid(True, alpha=0.3)
-    
-    fig.suptitle('Stimulus Onset Detection Statistics', fontsize=13, fontweight='bold', y=0.995)
-    
-    return fig
+    if return_fig_ax:
+        return fig, axes
+    else:
+        plt.show()
+        return None
 
+# ============ Plot channel means with std envelope ========================
 
-# ================== USAGE ==================
-
-print("\n" + "="*70)
-print("VISUALIZING STIMULUS ONSET DETECTION")
-print("="*70)
-
-# Plot 1: All epochs with detected onsets marked
-print("\nGenerating plot 1: All epochs with onset markers...")
-fig1 = plot_stimulus_onset_detection(
-    edata_uV,
-    stimulus_onsets,
-    channel_onsets,
-    epochs.times,  # or use epochs.times if plotting original data
-    eeg_labels,
-    sfreq,
-    n_cols=6,
-    show_individual_epochs=True,
-    show_mean=True,
-    mark_color='red',
-    mark_style='o',
-    mark_size=5,
-    verbose=True
-)
-plt.show()
-
-# Plot 2: Statistics about onset detection
-print("\nGenerating plot 2: Onset detection statistics...")
-fig2 = plot_stimulus_onset_statistics(
-    stimulus_onsets,
-    channel_onsets,
-    sfreq,
-    reliability_scores=reliability_scores,
-    verbose=True
-)
-plt.show()
-
-print("\n✓ Plots generated successfully!")
-
-# ================== Detection of stimulus onset ====================================
-
-print("\n" + "="*50)
-print("DETECTING STIMULUS ONSET PER EPOCH (Improved)")
-print("="*50)
-
-stimulus_onsets, reliability_scores, channel_onsets = find_stimulus_onset_per_epoch_v2(
-    edata_uV,
-    sfreq,
-    list(epochs.ch_names),
-    method='amplitude_envelope',  # Try this first
-    use_best_channels=True,
-    num_best_channels=5,
-    verbose=True
+plot_channel_means_with_envelope_same_color_ms(
+    edata_sources={'edata': edata},
+    times=times,
+    ch_names=ch_names,
+    mean_color='tab:blue',
+    envelope_kind='std',
+    envelope_alpha=0.35,
+    envelope_lighten_frac=0.50,
+    return_fig_ax=False
 )
 
-print(f"\nStimulus onset statistics:")
-print(f"  Mean: {np.mean(stimulus_onsets/sfreq)*1000:.2f} ms")
-print(f"  Std: {np.std(stimulus_onsets/sfreq)*1000:.2f} ms")
-print(f"  Min: {np.min(stimulus_onsets/sfreq)*1000:.2f} ms")
-print(f"  Max: {np.max(stimulus_onsets/sfreq)*1000:.2f} ms")
-
-# Plot reliability
-fig, ax = plt.subplots(figsize=(12, 4))
-ax.bar(range(len(reliability_scores)), reliability_scores, color=['red' if r < 0.5 else 'green' for r in reliability_scores])
-ax.axhline(0.5, color='orange', linestyle='--', label='Reliability threshold')
-ax.set_xlabel('Epoch')
-ax.set_ylabel('Reliability Score')
-ax.set_title('Stimulus Detection Reliability per Epoch')
-ax.legend()
-plt.tight_layout()
-plt.show()
-
-
-# ================== FILTER GOOD EPOCHS ==================
-print("\n" + "="*50)
-print("FILTERING GOOD EPOCHS")
-print("="*50)
-
-# Create mask for good epochs (reliability >= 0.5)
-good_epochs_mask = reliability_scores >= 0.5
-n_good_epochs = np.sum(good_epochs_mask)
-
-print(f"Total epochs: {len(reliability_scores)}")
-print(f"Good epochs (reliability ≥ 0.5): {n_good_epochs}")
-print(f"Poor epochs (reliability < 0.5): {len(reliability_scores) - n_good_epochs}")
-
-# ================== REALIGN TO STIMULUS ONSET ==================
-print("\n" + "="*50)
-print("REALIGNING EPOCHS TO STIMULUS ONSET")
-print("="*50)
-
-# Realign epochs so they start at stimulus onset
-tmin_realigned = 0.0      # Start AT stimulus onset
-tmax_realigned = 0.5     # 490 ms after stimulus
-
-edata_realigned, times_realigned, valid_epochs = realign_epochs_to_stimulus(
-    edata_uV,
-    stimulus_onsets,
-    sfreq,
-    tmin_new=tmin_realigned,
-    tmax_new=tmax_realigned,
-    verbose=True
-)
-
-print(f"Realigned data shape: {edata_realigned.shape}")
-print(f"Time range: [{times_realigned[0]:.4f}, {times_realigned[-1]:.4f}] s")
 
 # ================== CROP STIMULUS ARTIFACT ==================
 print("\n" + "="*50)
@@ -1009,29 +675,13 @@ print(f"Removing stimulus artifact: {crop_duration_ms} ms ({crop_samples} sample
 
 # Remove the first N samples (stimulus artifact period)
 # After removal: data starts at ~10.5 ms after stimulus onset
-edata_cropped_all = edata_realigned[:, :, crop_samples:]
-times_cropped_all = times_realigned[crop_samples:]
+edata_cropped_all = edata[:, :, crop_samples:] * 1e6
+times_cropped_all = times[crop_samples:]
 
 print(f"After cropping:")
 print(f"  Data shape: {edata_cropped_all.shape}")
 print(f"  Time range: [{times_cropped_all[0]:.4f}, {times_cropped_all[-1]:.4f}] s")
 
-# ================== SELECT ONLY GOOD EPOCHS ==================
-print("\n" + "="*50)
-print("SELECTING GOOD EPOCHS")
-print("="*50)
-
-# Select only good epochs
-edata_good = edata_cropped_all[good_epochs_mask]
-stimulus_onsets_good = stimulus_onsets[good_epochs_mask]
-reliability_scores_good = reliability_scores[good_epochs_mask]
-
-print(f"Final data shape (good epochs only): {edata_good.shape}")
-print(f"  Epochs: {edata_good.shape[0]}")
-print(f"  Channels: {edata_good.shape[1]}")
-print(f"  Samples per epoch: {edata_good.shape[2]}")
-print(f"  Epoch duration: {(edata_good.shape[2] - 1) / sfreq * 1000:.1f} ms")
-print(f"\nMean reliability (good epochs): {np.mean(reliability_scores_good):.3f}")
 
 # ================== COMPUTE EVOKED POTENTIAL ==================
 print("\n" + "="*50)
@@ -1039,7 +689,7 @@ print("COMPUTING EVOKED POTENTIAL")
 print("="*50)
 
 # Average across good epochs
-evoked_potential = np.mean(edata_good, axis=0)  # shape: (n_channels, n_times)
+evoked_potential = np.mean(edata_cropped_all, axis=0)  # shape: (n_channels, n_times)
 
 print(f"Evoked potential shape: {evoked_potential.shape}")
 
@@ -1073,7 +723,7 @@ for i in range(n_ch):
 for ax in axes[n_ch:]:
     ax.axis('off')
 
-fig.suptitle(f"Evoked Potential After Stimulus Cropping\n({edata_good.shape[0]} good epochs, stimulus artifact removed)")
+fig.suptitle(f"Evoked Potential After Stimulus Cropping\n({edata.shape[0]} good epochs, stimulus artifact removed)")
 plt.tight_layout(rect=[0, 0, 1, 0.96])
 plt.show()
 
@@ -1085,8 +735,8 @@ ch_idx = 0
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6), sharex=False)
 
 # Before cropping
-mean_before = np.mean(edata_realigned[good_epochs_mask, ch_idx, :], axis=0)
-ax1.plot(times_realigned, mean_before, color='C0', lw=1.5)
+mean_before = np.mean(edata[:, ch_idx, :]*1e6, axis=0)
+ax1.plot(times, mean_before, color='C0', lw=1.5)
 ax1.axvspan(0, crop_duration_s, alpha=0.3, color='red', label=f'Removed: {crop_duration_ms} ms')
 ax1.axvline(0, color='k', linestyle='--', alpha=0.6)
 ax1.set_ylabel('µV')
@@ -1095,7 +745,7 @@ ax1.legend()
 ax1.grid(True, alpha=0.3)
 
 # After cropping
-mean_after = np.mean(edata_good[:, ch_idx, :], axis=0)
+mean_after = np.mean(edata_cropped_all[:, ch_idx, :], axis=0)
 ax2.plot(times_cropped_all, mean_after, color='C1', lw=1.5)
 ax2.axvline(0, color='k', linestyle='--', alpha=0.6, label='Stimulus onset + artifact')
 ax2.set_xlabel('Time (s)')
@@ -1107,47 +757,654 @@ ax2.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.show()
 
-# ================== SAVE RESULTS ==================
+# --------- Plot cropped means per channel -------------------------
+
+plot_channel_means_with_envelope_same_color_ms(
+    edata_sources={'edata': edata_cropped_all},
+    times=times_cropped_all,
+    ch_names=ch_names,
+    mean_color='tab:blue',
+    envelope_kind='std',
+    envelope_alpha=0.35,
+    envelope_lighten_frac=0.50,
+    return_fig_ax=False
+)
+
+# =================== Peak Detection ====================================
+
+
+try:
+    from scipy.ndimage import gaussian_filter1d
+except Exception:
+    gaussian_filter1d = None  # fallback: no smoothing if scipy not available
+
+
+def _ensure_times_ms(times: np.ndarray, n_times: int) -> np.ndarray:
+    times = np.asarray(times)
+    if times.size != n_times:
+        # if lengths mismatch, resample times linearly to match n_times
+        times = np.linspace(float(times[0]), float(times[-1]), n_times)
+    # convert seconds -> ms if values look like seconds (max <= 1000)
+    if np.nanmax(np.abs(times)) <= 1000:
+        return times * 1000.0
+    return times.copy()
+
+
+def _smooth_trace(trace: np.ndarray, sigma_samples: float) -> np.ndarray:
+    if sigma_samples is None or sigma_samples <= 0:
+        return trace
+    if gaussian_filter1d is None:
+        # scipy not available: do a very simple moving average as fallback
+        w = max(3, int(round(sigma_samples * 2 + 1)))
+        kernel = np.ones(w) / float(w)
+        return np.convolve(trace, kernel, mode='same')
+    else:
+        return gaussian_filter1d(trace, sigma=sigma_samples, mode='mirror')
+
+
+def find_first_n_turning_points_per_channel(
+    edata: Optional[np.ndarray] = None,
+    epochs=None,
+    evoked=None,
+    times: Optional[np.ndarray] = None,
+    ch_names: Optional[List[str]] = None,
+    n_peaks: int = 4,
+    smooth_sigma_ms: Optional[float] = 2.0,
+    min_peak_distance_ms: float = 8.0,
+    prominence_abs: Optional[float] = None,
+    time_window_ms: Optional[Tuple[float, float]] = None,
+    invert_set: Optional[List[str]] = None,
+    plot_results: bool = False,
+    return_dataframe: bool = True
+) -> Union[pd.DataFrame, dict]:
+    """
+    Detect turning points (first derivative zero crossings) and return the first
+    n_peaks (time-ordered) for each channel.
+
+    Parameters
+    ----------
+    edata : ndarray (n_epochs, n_ch, n_times) or None
+        Epoch data. If None, provide `epochs` or `evoked`.
+    epochs : mne.Epochs-like (optional)
+        Used to get data and times if edata is None.
+    evoked : mne.Evoked-like (optional)
+        Used if provided (averaged data).
+    times : array-like (n_times,) in seconds or ms. Required if edata is provided.
+    ch_names : list of channel names (n_ch,)
+    n_peaks : int
+        Number of earliest turning points (per channel) to return.
+    smooth_sigma_ms : float or None
+        Gaussian smoothing sigma (ms) applied to the trace before derivative.
+    min_peak_distance_ms : float
+        Minimum spacing (ms) enforced between reported turning points (per channel).
+    prominence_abs : float or None
+        Minimum absolute amplitude difference (µV) to accept a turning point.
+        If None a heuristic of 5% of peak-to-peak (or 1 µV) is used per channel.
+    time_window_ms : (tmin_ms, tmax_ms) or None
+        If provided, restrict search to this window.
+    plot_results : bool
+        If True, plot the mean traces and annotate found turning points.
+    return_dataframe : bool
+        If True return a pandas.DataFrame, else return a dict mapping channel -> list.
+
+    Returns
+    -------
+    pandas.DataFrame or dict
+    """
+
+    edata = np.asarray(edata)
+
+    n_epochs, n_ch, n_times = edata.shape
+
+    times_ms = _ensure_times_ms(np.asarray(times), n_times)
+    dt_ms = np.mean(np.diff(times_ms))
+
+    # channel names
+    if ch_names is None:
+        ch_names = [f"ch{i}" for i in range(n_ch)]
+    if len(ch_names) != n_ch:
+        raise ValueError("ch_names length mismatch with data channels")
+
+    # unit conversion: assume Volts if small values -> convert to µV
+    if np.nanmax(np.abs(edata)) < 1e-2:
+        edata_uV = edata * 1e6
+    else:
+        edata_uV = edata.copy()
+
+    # compute mean trace per channel
+    mean_traces = np.nanmean(edata_uV, axis=0)  # (n_ch, n_times)
+
+    # restrict to time window
+    if time_window_ms is not None:
+        tmin_ms, tmax_ms = time_window_ms
+        win_mask = (times_ms >= tmin_ms) & (times_ms <= tmax_ms)
+        if not np.any(win_mask):
+            raise ValueError("time_window_ms does not overlap times.")
+        win_idx = np.where(win_mask)[0]
+        win_start, win_end = win_idx[0], win_idx[-1] + 1
+    else:
+        win_start, win_end = 0, n_times
+
+    results = []
+    results_dict = {}
+
+    min_dist_pts = max(1, int(round(min_peak_distance_ms / dt_ms)))
+    # smoothing sigma in samples
+    sigma_samples = None
+    if smooth_sigma_ms is not None and smooth_sigma_ms > 0:
+        sigma_samples = max(0.5, float(smooth_sigma_ms / dt_ms))
+
+    for ch in range(n_ch):
+        trace = mean_traces[ch, :]
+        
+        # Decide whether to invert this channel for detection
+        invert = (ch_names[ch] in invert_set)
+        
+        # Build detection trace. If invert==True we multiply by -1 so troughs become peaks.
+        trace = -trace if invert else trace
+        
+        # smooth trace (helps derivative stability)
+        trace_s = _smooth_trace(trace, sigma_samples) if sigma_samples is not None else trace
+
+        # restrict window
+        t_win = times_ms[win_start:win_end]
+        tr_win = trace_s[win_start:win_end]
+
+        # derivative (dX/dt) in µV per ms
+        deriv = np.gradient(tr_win, dt_ms)
+
+        # find zero-crossings of derivative: where sign changes
+        # Avoid sign(0) issues by adding small eps to derivative
+        eps = 1e-12
+        s = np.sign(deriv + eps)
+        sign_changes = np.where(s[:-1] * s[1:] < 0)[0]  # indices i where sign changes between i and i+1
+        # sign change at index i corresponds to a turning between samples i and i+1.
+        # We'll refine by searching local extremum in a small neighborhood around i+1
+        candidates = []
+        for i in sign_changes:
+            # convert to absolute index in original trace
+            center_idx = win_start + (i + 1)
+            # neighborhood ± min_dist_pts (but limited)
+            left = max(win_start, center_idx - min_dist_pts)
+            right = min(win_end - 1, center_idx + min_dist_pts)
+            # find true extremum in original (unsmoothed) trace for amplitude accuracy
+            seg = trace[left:right + 1]
+            if deriv[i] > 0 and deriv[i + 1] < 0:
+                # positive to negative => local maximum
+                rel = int(np.argmax(seg))
+                peak_idx = left + rel
+                polarity = 'pos'
+                amp = float(-trace[peak_idx]) if invert else float(trace[peak_idx])
+            else:
+                # unexpected (shouldn't happen), skip
+                continue
+            candidates.append((int(peak_idx), amp, polarity))
+
+        # deduplicate very close candidates (keep the earliest)
+        if candidates:
+            # sort by index (time)
+            candidates = sorted(candidates, key=lambda x: x[0])
+            deduped = []
+            last_idx = -9999
+            for idx_abs, amp, pol in candidates:
+                if idx_abs - last_idx <= min_dist_pts:
+                    # too close to previous; keep the one with larger abs amplitude
+                    prev_idx, prev_amp, prev_pol = deduped[-1]
+                    if abs(amp) > abs(prev_amp):
+                        deduped[-1] = (idx_abs, amp, pol)
+                        last_idx = idx_abs
+                    else:
+                        # keep previous, skip current
+                        continue
+                else:
+                    deduped.append((idx_abs, amp, pol))
+                    last_idx = idx_abs
+            candidates = deduped
+
+        # apply prominence/absolute amplitude threshold
+        if prominence_abs is None:
+            # heuristic: 5% of peak-to-peak in the search window but at least 1 µV
+            p2p = np.nanmax(tr_win) - np.nanmin(tr_win)
+            prom_thresh = max(1.0, 0.05 * p2p)
+        else:
+            prom_thresh = float(prominence_abs)
+
+        filtered = []
+        for idx_abs, amp, pol in candidates:
+            if abs(amp) >= prom_thresh:
+                filtered.append((idx_abs, amp, pol))
+        # keep first n_peaks in time order; pad if fewer
+        peaks_for_channel = []
+        for rank in range(n_peaks):
+            if rank < len(filtered):
+                idx_abs, amp, pol = filtered[rank]
+                latency = float(times_ms[idx_abs])
+                peaks_for_channel.append((rank + 1, latency, amp, pol, int(idx_abs)))
+                results.append({
+                    'channel': ch_names[ch],
+                    'peak_rank': rank + 1,
+                    'latency_ms': latency,
+                    'amplitude_uV': amp,
+                    'polarity': pol,
+                    'index': int(idx_abs)
+                })
+            else:
+                peaks_for_channel.append((rank + 1, np.nan, np.nan, None, None))
+                results.append({
+                    'channel': ch_names[ch],
+                    'peak_rank': rank + 1,
+                    'latency_ms': np.nan,
+                    'amplitude_uV': np.nan,
+                    'polarity': None,
+                    'index': None
+                })
+        results_dict[ch_names[ch]] = peaks_for_channel
+        invert = False
+
+    df = pd.DataFrame(results, columns=['channel', 'peak_rank', 'latency_ms', 'amplitude_uV', 'polarity', 'index'])
+    
+    if plot_results:
+        n_cols = min(6, n_ch)
+        n_rows = int(np.ceil(n_ch / n_cols))
+        fig, axs = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 2.6 * n_rows), squeeze=False)
+        axs = axs.reshape(-1)
+        for i, ch in enumerate(range(n_ch)):
+            ax = axs[i]
+            ax.plot(times_ms, mean_traces[ch, :], color='C0', lw=1.2)
+            pe_list = results_dict[ch_names[ch]]
+            for (_, lat, amp, pol, idx_abs) in pe_list:
+                if idx_abs is None:
+                    continue
+                color = 'tab:green' if pol == 'pos' else 'tab:red'
+                ax.plot(times_ms[idx_abs], amp, marker='o', color=color)
+                ax.text(times_ms[idx_abs], amp, f"{lat:.0f} ms", fontsize=7, ha='left', va='bottom')
+            ax.set_title(ch_names[ch], fontsize=9)
+            ax.set_xlabel('Time (ms)')
+            ax.set_ylabel('µV')
+            ax.grid(alpha=0.2)
+        # hide unused subplots
+        for j in range(n_ch, len(axs)):
+            axs[j].axis('off')
+        plt.tight_layout()
+
+    if return_dataframe:
+        return df
+    else:
+        return results_dict
+
+
+
+df = find_first_n_turning_points_per_channel(
+    edata=edata_cropped_all,
+    times=times_cropped_all,
+    ch_names=ch_names,
+    n_peaks=4,
+    smooth_sigma_ms=1.0,
+    min_peak_distance_ms=5.0,
+    prominence_abs=None,
+    time_window_ms=(0, 200),
+    invert_set = ['EEG F3', 'EEEG F1', 'EEG Fz', 'EEG F2', 'EEG F4'],
+    plot_results=True,
+    return_dataframe=True
+)
+print(df)
+
+
+
+
 """
-print("\n" + "="*50)
-print("SAVING RESULTS")
-print("="*50)
+find_first_n_turning_points_with_table_labels.py
 
-# Option 1: Save as numpy arrays
-output_dir = r"C:\Users\marti\OneDrive\Documents\HSJD\Cerebelo\Chimula Mark"
-np.save(f"{output_dir}/evoked_potential.npy", evoked_potential)
-np.save(f"{output_dir}/edata_good.npy", edata_good)
-np.save(f"{output_dir}/times_cropped.npy", times_cropped_all)
-np.save(f"{output_dir}/channel_names.npy", np.array(eeg_labels))
+Detect turning points (first-derivative zero crossings) and return the first
+n_peaks (time-ordered) for each channel. For plotting, the function now:
 
-print(f"✓ Saved to {output_dir}/")
-print(f"  - evoked_potential.npy: shape {evoked_potential.shape}")
-print(f"  - edata_good.npy: shape {edata_good.shape}")
-print(f"  - times_cropped.npy: shape {times_cropped_all.shape}")
+- Adds small text labels on top of each detected peak following the natural order
+  of appearance: N0, N1, N2, N3 (N(index-1) for peak_rank index).
+- Adds a compact summary "table" at the top-right of each subplot listing for
+  each labeled peak its latency and amplitude (units: ms, µV). Missing peaks
+  are shown as "--".
+
+The function otherwise preserves the prior behavior:
+- smoothing before derivative,
+- extracting amplitude from original (unsmoothed) mean trace,
+- optional baseline-window amplitude subtraction (amplitude_from_baseline_uV),
+- returns a pandas DataFrame and optionally plots the annotated figure.
+
+Usage:
+    df = find_first_n_turning_points_per_channel(
+        edata=edata_cropped_all,
+        times=times_cropped_all,
+        ch_names=ch_names,
+        n_peaks=4,
+        smooth_sigma_ms=1.0,
+        min_peak_distance_ms=5.0,
+        prominence_abs=None,
+        time_window_ms=(0,200),
+        baseline_window_ms=(-200,0),
+        plot_results=True,
+        return_dataframe=True
+    )
 """
-# Option 2: Create a summary report
-summary = {
-    'total_epochs': len(reliability_scores),
-    'good_epochs': n_good_epochs,
-    'poor_epochs': len(reliability_scores) - n_good_epochs,
-    'sfreq': sfreq,
-    'crop_duration_ms': crop_duration_ms,
-    'stimulus_onset_mean_ms': np.mean(stimulus_onsets / sfreq) * 1000,
-    'stimulus_onset_std_ms': np.std(stimulus_onsets / sfreq) * 1000,
-    'channels': eeg_labels,
-    'evoked_potential_shape': evoked_potential.shape,
-    'time_range_s': [float(times_cropped_all[0]), float(times_cropped_all[-1])],
-}
+from typing import Optional, List, Tuple, Union, Dict
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+try:
+    from scipy.ndimage import gaussian_filter1d
+except Exception:
+    gaussian_filter1d = None  # fallback: no smoothing if scipy not available
 
 
+def _ensure_times_ms(times: np.ndarray, n_times: int) -> np.ndarray:
+    times = np.asarray(times)
+    if times.size != n_times:
+        # if lengths mismatch, resample times linearly to match n_times
+        times = np.linspace(float(times[0]), float(times[-1]), n_times)
+    # convert seconds -> ms if values look like seconds (max <= 1000)
+    if np.nanmax(np.abs(times)) <= 1000:
+        return times * 1000.0
+    return times.copy()
+
+
+def _smooth_trace(trace: np.ndarray, sigma_samples: Optional[float]) -> np.ndarray:
+    if sigma_samples is None or sigma_samples <= 0:
+        return trace
+    if gaussian_filter1d is None:
+        # scipy not available: do a very simple moving average as fallback
+        w = max(3, int(round(sigma_samples * 2 + 1)))
+        kernel = np.ones(w) / float(w)
+        return np.convolve(trace, kernel, mode='same')
+    else:
+        return gaussian_filter1d(trace, sigma=sigma_samples, mode='mirror')
+
+
+def find_first_n_turning_points_per_channel(
+    edata: Optional[np.ndarray] = None,
+    epochs=None,
+    evoked=None,
+    times: Optional[np.ndarray] = None,
+    ch_names: Optional[List[str]] = None,
+    n_peaks: int = 4,
+    smooth_sigma_ms: Optional[float] = 2.0,
+    min_peak_distance_ms: float = 8.0,
+    prominence_abs: Optional[float] = None,
+    time_window_ms: Optional[Tuple[float, float]] = None,
+    baseline_window_ms: Optional[Tuple[float, float]] = None,
+    invert_set: Optional[List[str]] = None,
+    plot_results: bool = False,
+    return_dataframe: bool = True
+) -> Union[pd.DataFrame, Dict[str, List[Tuple[int, float, float, float, Optional[str], Optional[int]]]]]:
+    """
+    Detect turning points (first derivative zero crossings) and return the first
+    n_peaks (time-ordered) for each channel. Also compute amplitudes for each peak
+    and annotate plots with N0..N3 labels plus a small summary table.
+
+    New parameter:
+      - baseline_window_ms: optional (tmin_ms, tmax_ms). If provided, compute the mean of the
+        channel mean trace within this window and report amplitude_from_baseline_uV = peak - baseline_mean.
+        If None, amplitude_from_baseline_uV is set to np.nan.
+
+    Returns DataFrame columns:
+      ['channel', 'peak_rank', 'latency_ms', 'amplitude_uV', 'amplitude_from_baseline_uV', 'polarity', 'index']
+    """
+
+    edata = np.asarray(edata)
+    if edata.ndim != 3:
+        raise ValueError("edata must be 3D: (n_epochs, n_ch, n_times)")
+
+    n_epochs, n_ch, n_times = edata.shape
+
+    if times is None:
+        raise RuntimeError("times vector is required (pass times or an epochs/evoked object).")
+
+    times_ms = _ensure_times_ms(np.asarray(times), n_times)
+    dt_ms = np.mean(np.diff(times_ms))
+
+    # channel names
+    if ch_names is None:
+        ch_names = [f"ch{i}" for i in range(n_ch)]
+    if len(ch_names) != n_ch:
+        raise ValueError("ch_names length mismatch with data channels")
+
+    # unit conversion: assume Volts if small values -> convert to µV
+    if np.nanmax(np.abs(edata)) < 1e-2:
+        edata_uV = edata * 1e6
+    else:
+        edata_uV = edata.copy()
+
+    # compute mean trace per channel
+    mean_traces = np.nanmean(edata_uV, axis=0)  # (n_ch, n_times)
+
+    # compute baseline means if requested (from original mean traces, not smoothed)
+    if baseline_window_ms is not None:
+        bmin, bmax = baseline_window_ms
+        bmask = (times_ms >= bmin) & (times_ms <= bmax)
+        if not np.any(bmask):
+            raise ValueError("baseline_window_ms does not overlap times.")
+        baseline_means = np.nanmean(mean_traces[:, bmask], axis=1)  # shape (n_ch,)
+    else:
+        baseline_means = np.full((n_ch,), np.nan)
+
+    # restrict to time window
+    if time_window_ms is not None:
+        tmin_ms, tmax_ms = time_window_ms
+        win_mask = (times_ms >= tmin_ms) & (times_ms <= tmax_ms)
+        if not np.any(win_mask):
+            raise ValueError("time_window_ms does not overlap times.")
+        win_idx = np.where(win_mask)[0]
+        win_start, win_end = win_idx[0], win_idx[-1] + 1
+    else:
+        win_start, win_end = 0, n_times
+
+    results = []
+    results_dict = {}
+
+    min_dist_pts = max(1, int(round(min_peak_distance_ms / dt_ms)))
+    # smoothing sigma in samples
+    sigma_samples = None
+    if smooth_sigma_ms is not None and smooth_sigma_ms > 0:
+        sigma_samples = max(0.5, float(smooth_sigma_ms / dt_ms))
+
+    for ch in range(n_ch):
+        trace = mean_traces[ch, :]
+        
+        # Decide whether to invert this channel for detection
+        invert = (ch_names[ch] in invert_set)
+        
+        # Build detection trace. If invert==True we multiply by -1 so troughs become peaks.
+        trace = -trace if invert else trace
+        
+        
+        # smooth trace (helps derivative stability) - derivative computed on smoothed trace
+        trace_s = _smooth_trace(trace, sigma_samples) if sigma_samples is not None else trace
+
+        # restrict window (operate on smoothed trace for derivative, but amplitudes read from original trace)
+        t_win = times_ms[win_start:win_end]
+        tr_win = trace_s[win_start:win_end]
+        tr_orig_win = trace[win_start:win_end]  # original unsmoothed window for amplitude reading
+
+        # derivative (dX/dt) in µV per ms
+        deriv = np.gradient(tr_win, dt_ms)
+
+        # find zero-crossings of derivative: sign-change detection (robustness to zero)
+        small_eps = 1e-12
+        s = np.sign(deriv + small_eps)
+        sign_changes = np.where(s[:-1] * s[1:] < 0)[0]  # indices i where sign changes between i and i+1
+
+        candidates = []
+        for i in sign_changes:
+            # convert to absolute index in original trace
+            center_idx = win_start + (i + 1)
+            # neighborhood ± min_dist_pts (but limited)
+            left = max(win_start, center_idx - min_dist_pts)
+            right = min(win_end - 1, center_idx + min_dist_pts)
+            # find true extremum in original (unsmoothed) trace for amplitude accuracy
+            seg = trace[left:right + 1]
+            if deriv[i] > 0 and deriv[i + 1] < 0:
+                # positive to negative => local maximum
+                rel = int(np.argmax(seg))
+                peak_idx = left + rel
+                polarity = 'pos'
+            else:
+                # unexpected (shouldn't happen), skip
+                continue
+            # amplitude from original unsmoothed mean trace
+            amp = float(-trace[peak_idx]) if invert else float(trace[peak_idx])
+            candidates.append((int(peak_idx), amp, polarity))
+
+        # deduplicate very close candidates (keep the earliest/largest)
+        if candidates:
+            candidates = sorted(candidates, key=lambda x: x[0])
+            deduped = []
+            last_idx = -9999
+            for idx_abs, amp, pol in candidates:
+                if idx_abs - last_idx <= min_dist_pts:
+                    prev_idx, prev_amp, prev_pol = deduped[-1]
+                    if abs(amp) > abs(prev_amp):
+                        deduped[-1] = (idx_abs, amp, pol)
+                        last_idx = idx_abs
+                    else:
+                        continue
+                else:
+                    deduped.append((idx_abs, amp, pol))
+                    last_idx = idx_abs
+            candidates = deduped
+
+        # apply prominence/absolute amplitude threshold (using smoothed window amplitude range if heuristic)
+        if prominence_abs is None:
+            # heuristic: 5% of peak-to-peak in the smoothed search window but at least 1 µV
+            p2p = np.nanmax(tr_win) - np.nanmin(tr_win)
+            prom_thresh = max(1.0, 0.05 * p2p)
+        else:
+            prom_thresh = float(prominence_abs)
+
+        filtered = []
+        for idx_abs, amp, pol in candidates:
+            if abs(amp) >= prom_thresh:
+                filtered.append((idx_abs, amp, pol))
+
+        # keep first n_peaks in time order; compute amplitude_from_baseline too
+        peaks_for_channel = []
+        for rank in range(n_peaks):
+            if rank < len(filtered):
+                idx_abs, amp, pol = filtered[rank]
+                latency = float(times_ms[idx_abs])
+                # amplitude from original mean trace (already amp)
+                amplitude_uV = amp
+                # amplitude relative to baseline (if baseline provided)
+                baseline_mean = baseline_means[ch]
+                if not np.isnan(baseline_mean):
+                    amplitude_from_baseline_uV = amplitude_uV - float(baseline_mean)
+                else:
+                    amplitude_from_baseline_uV = np.nan
+                peaks_for_channel.append((rank + 1, latency, amplitude_uV, amplitude_from_baseline_uV, pol, int(idx_abs)))
+                results.append({
+                    'channel': ch_names[ch],
+                    'peak_rank': rank + 1,
+                    'latency_ms': latency,
+                    'amplitude_uV': amplitude_uV,
+                    'amplitude_from_baseline_uV': amplitude_from_baseline_uV,
+                    'polarity': pol,
+                    'index': int(idx_abs)
+                })
+            else:
+                peaks_for_channel.append((rank + 1, np.nan, np.nan, np.nan, None, None))
+                results.append({
+                    'channel': ch_names[ch],
+                    'peak_rank': rank + 1,
+                    'latency_ms': np.nan,
+                    'amplitude_uV': np.nan,
+                    'amplitude_from_baseline_uV': np.nan,
+                    'polarity': None,
+                    'index': None
+                })
+        results_dict[ch_names[ch]] = peaks_for_channel
+        invert = False
+        
+    df = pd.DataFrame(results, columns=['channel', 'peak_rank', 'latency_ms', 'amplitude_uV', 'amplitude_from_baseline_uV', 'polarity', 'index'])
+
+    if plot_results:
+        n_cols = min(6, n_ch)
+        n_rows = int(np.ceil(n_ch / n_cols))
+        fig, axs = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 2.6 * n_rows), squeeze=False)
+        axs = axs.reshape(-1)
+
+        for i, ch in enumerate(range(n_ch)):
+            ax = axs[i]
+            ax.plot(times_ms, mean_traces[ch, :], color='C0', lw=1.2)
+            pe_list = results_dict[ch_names[ch]]
+            # determine a small vertical offset for labels (5% of y-range)
+            y_min, y_max = np.nanmin(mean_traces[ch, :]), np.nanmax(mean_traces[ch, :])
+            y_range = y_max - y_min if (y_max > y_min) else 1.0
+            y_offset = 0.05 * y_range
+
+            # build summary lines for the "table" at top-right
+            lines = []
+            for (rank, latency, amp, amp_from_base, pol, idx_abs) in pe_list:
+                label_name = f"N{rank-1}"
+                if idx_abs is None:
+                    lines.append(f"{label_name}: --")
+                else:
+                    if not np.isnan(amp_from_base):
+                        lines.append(f"{label_name}: {int(round(latency))} ms, {amp_from_base:.1f} µV")
+                    else:
+                        lines.append(f"{label_name}: {int(round(latency))} ms, {amp:.1f} µV")
+
+            # plot peak markers and small peak labels N0..N3 above the peaks
+            for (rank, latency, amp, amp_from_base, pol, idx_abs) in pe_list:
+                if idx_abs is None:
+                    continue
+                label_name = f"N{rank-1}"
+                color = 'tab:green' if pol == 'pos' else 'tab:red'
+                ax.plot(times_ms[idx_abs], amp, marker='o', color=color)
+                # place the small name above the marker
+                ax.text(times_ms[idx_abs], amp + y_offset, label_name,
+                        fontsize=8, ha='center', va='bottom', fontweight='bold', color=color)
+
+            # draw the small summary table in top-right using axes coordinates
+            table_text = "\n".join(lines)
+            ax.text(0.98, 0.98, table_text, transform=ax.transAxes,
+                    ha='right', va='top', fontsize=8,
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.85, edgecolor='gray'))
+
+            ax.set_title(ch_names[ch], fontsize=9)
+            ax.set_xlabel('Time (ms)')
+            ax.set_ylabel('µV')
+            ax.grid(alpha=0.2)
+
+        # hide unused subplots
+        for j in range(n_ch, len(axs)):
+            axs[j].axis('off')
+        plt.tight_layout()
+
+    if return_dataframe:
+        return df
+    else:
+        return results_dict
+    
+    
+df = find_first_n_turning_points_per_channel(
+    edata=edata_cropped_all,
+    times=times_cropped_all,
+    ch_names=ch_names,
+    n_peaks=4,
+    smooth_sigma_ms=1.5,
+    min_peak_distance_ms=5.0,
+    prominence_abs=None,
+    time_window_ms=(0, 200),    
+    invert_set = ['EEG F3', 'EEEG F1', 'EEG Fz', 'EEG F2', 'EEG F4'],
+    plot_results=True,
+    return_dataframe=True
+)
 
 # ================== GROUP AVERAGING ==================
 print("\n" + "="*50)
 print("AVERAGING EPOCHS IN GROUPS OF 40")
 print("="*50)
 
-group_size = 15
-n_good_epochs = edata_good.shape[0]
+group_size = 5
+n_good_epochs = edata_cropped_all.shape[0]
 n_groups = int(np.floor(n_good_epochs / group_size))
 remainder = n_good_epochs % group_size
 
@@ -1165,7 +1422,7 @@ for group_idx in range(n_groups):
     end_idx = start_idx + group_size
     
     # Average this group
-    group_data = edata_good[start_idx:end_idx]
+    group_data = edata_cropped_all[start_idx:end_idx]
     group_mean = np.mean(group_data, axis=0)  # shape: (n_channels, n_times)
     
     grouped_averages.append(group_mean)
@@ -1173,11 +1430,25 @@ for group_idx in range(n_groups):
         'group_num': group_idx + 1,
         'start_epoch': start_idx,
         'end_epoch': end_idx,
-        'n_epochs': group_size,
-        'mean_reliability': np.mean(reliability_scores_good[start_idx:end_idx])
+        'n_epochs': group_size
     })
     
-    print(f"  Group {group_idx + 1}: epochs {start_idx}-{end_idx-1} (reliability: {group_info[-1]['mean_reliability']:.3f})")
+    find_first_n_turning_points_per_channel(
+    edata=group_data,
+    times=times_cropped_all,
+    ch_names=ch_names,
+    n_peaks=4,
+    smooth_sigma_ms=1,
+    min_peak_distance_ms=5.0,
+    prominence_abs=None,
+    time_window_ms=(0, 200),
+    invert_set = ['EEG F3', 'EEEG F1', 'EEG Fz', 'EEG F2', 'EEG F4'],
+    plot_results=True,
+    return_dataframe=True
+    )
+    
+    
+    print(f"  Group {group_idx + 1}: epochs {start_idx}-{end_idx-1}")
 
 # Handle remaining epochs if any
 if remainder > 0:
@@ -1192,11 +1463,9 @@ if remainder > 0:
         'group_num': n_groups + 1,
         'start_epoch': start_idx,
         'end_epoch': end_idx,
-        'n_epochs': remainder,
-        'mean_reliability': np.mean(reliability_scores_good[start_idx:end_idx])
-    })
+        'n_epochs': remainder})
     
-    print(f"  Group {n_groups + 1} (incomplete): epochs {start_idx}-{end_idx-1} ({remainder} epochs, reliability: {group_info[-1]['mean_reliability']:.3f})")
+    print(f"  Group {n_groups + 1} (incomplete): epochs {start_idx}-{end_idx-1} ")
 
 grouped_averages = np.array(grouped_averages)  # shape: (n_groups, n_channels, n_times)
 print(f"\nGrouped averages shape: {grouped_averages.shape}")
@@ -1254,7 +1523,7 @@ print(f"{'Group':<8} {'Epochs':<15} {'N':<5} {'Mean Reliability':<18}")
 print("-" * 80)
 for info in group_info:
     epoch_range = f"{info['start_epoch']}-{info['end_epoch']-1}"
-    print(f"{info['group_num']:<8} {epoch_range:<15} {info['n_epochs']:<5} {info['mean_reliability']:<18.3f}")
+    print(f"{info['group_num']:<8} {epoch_range:<15} {info['n_epochs']:<5}")
 print("-" * 80)
 
 # ================== PLOT ALL GROUPS ON SAME FIGURE (Optional) ==================
@@ -1285,6 +1554,7 @@ for ch_idx in range(n_channels):
     ax.set_xlim(times_cropped_all[0], times_cropped_all[-1])
     ax.grid(True, alpha=0.3)
 
+
 # Hide extra subplots
 for ax in axes[n_channels:]:
     ax.axis('off')
@@ -1297,38 +1567,7 @@ fig.suptitle("All Groups Overlay - Per Channel Average", fontsize=12, fontweight
 plt.tight_layout(rect=[0, 0.02, 1, 0.96])
 plt.show()
 
-# ================== STATISTICAL ANALYSIS ==================
-print("\n" + "="*50)
-print("STATISTICAL ANALYSIS ACROSS GROUPS")
-print("="*50)
 
-# Calculate peak amplitude for each group and channel
-peak_amplitudes = np.zeros((len(grouped_averages), n_channels))
-
-for group_idx, group_mean in enumerate(grouped_averages):
-    for ch_idx in range(n_channels):
-        # Find peak in a reasonable time window (e.g., 0.01-0.3s after stimulus)
-        time_mask = (times_cropped_all >= 0.01) & (times_cropped_all <= 0.3)
-        peak_amplitudes[group_idx, ch_idx] = np.max(np.abs(group_mean[ch_idx, time_mask]))
-
-print("\nPeak Amplitudes (µV) per Group and Channel:")
-print("-" * (80 + n_channels * 8))
-
-# Header
-header = "Group" + " " * 5
-for ch_idx in range(n_channels):
-    header += f"{eeg_labels[ch_idx]:<8}"
-print(header)
-print("-" * (80 + n_channels * 8))
-
-# Data rows
-for group_idx in range(len(grouped_averages)):
-    row = f"G{group_idx+1:<5}"
-    for ch_idx in range(n_channels):
-        row += f"{peak_amplitudes[group_idx, ch_idx]:>8.1f}"
-    print(row)
-
-print("-" * (80 + n_channels * 8))
 
 # ================== SAVE GROUP AVERAGES ==================
 print("\n" + "="*50)
@@ -1345,8 +1584,7 @@ import json
 group_info_json = {
     f"group_{info['group_num']}": {
         'epochs': f"{info['start_epoch']}-{info['end_epoch']-1}",
-        'n_epochs': info['n_epochs'],
-        'mean_reliability': float(info['mean_reliability'])
+        'n_epochs': info['n_epochs']
     }
     for info in group_info
 }
@@ -1363,11 +1601,6 @@ print(f"  - group_info.json: group metadata")
 # ===================== ALIGNMENT OF EPOCHS ============================
 
 # -------- PARAMETERS / fallback ignore list (same as before) ----------
-ignore_channels = [
-    'EEG Fp1', 'EEG Fp2', 'EEG EOGI', 'EEG T3', 'EEG T4',
-    'EEG O1', 'EEG EOGD', 'EEG O2', 'EEG A1', 'EEG A2', 'EEG EOGX'
-]
-
 out_fname = "concatenated_original_epochs_per_channel.npz"
 save_to_disk = True   # set False to skip saving file
 
