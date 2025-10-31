@@ -15,31 +15,39 @@ from typing import Optional, Union, Tuple, List, Dict, Any
 from matplotlib.colors import to_rgb
 import pandas as pd
 
+from tensorpac.utils import ITC, PSD
+
 # Specify the full path to your EDF file
-file_path = r"C:\Users\marti\Documents\HSJD\Cerebellum Evoked Potentials\Chimula Mark\13.14_stim.edf"  # Change this to your file path
+file_path = r"C:\Users\msedo\Documents\Cerebelo\Maria del Carmen Jimenez\13.52_stim.edf"  # Change this to your file path
 
 raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
 raw.drop_channels( ['Chin+','ECG+','DI+','DD+','RONQ+','CAN+','TER+','PCO2+','EtCO+','Pos+','Tor+','Abd+','TIBI+','TIBD+','thor+','abdo+','PULS+','BEAT+','SpO2+','MKR+'])
 raw.drop_channels([
-    'EEG Fp1', 'EEG Fp2', 'EEG EOGI', 'EEG T3', 'EEG T4',
-    'EEG O1', 'EEG EOGD', 'EEG O2', 'EEG A1', 'EEG A2', 'EEG EOGX'
+   'EEG Fp1', 'EEG Fp2', 'EEG EOGI', 'EEG T3', 'EEG T4',
+   'EEG O1', 'EEG EOGD', 'EEG O2', 'EEG A1', 'EEG A2', 'EEG EOGX'
 ])
+
+raw.drop_channels([
+    'EEG F4', 'EEG Cz'
+])
+
 # mapping: {old_name: new_name}
-mapping = {
-    'EEG F3': 'EEG F1',
-    'EEG F7': 'EEG F3',
-    'EEG C3' : 'EEG C1',
-    'EEG P3' : 'EEG CP1',
-    'EEG T5' : 'EEG CP3',
-    'EEG F4' : 'EEG F2',
-    'EEG F8' : 'EEG F4',
-    'EEG C4' : 'EEG C2',
-    'EEG P4' : 'EEG CP2',
-    'EEG T6' : 'EEG CP4'
+# mapping = {
+#     'EEG F3': 'EEG F1',
+#     'EEG F7': 'EEG F3',
+#     'EEG C3' : 'EEG C1',
+#     'EEG P3' : 'EEG CP1',
+#     'EEG T5' : 'EEG CP3',
+#     'EEG F4' : 'EEG F2',
+#     'EEG F8' : 'EEG F4',
+#     'EEG C4' : 'EEG C2',
+#     'EEG P4' : 'EEG CP2',
+#     'EEG T6' : 'EEG CP4'
 
-}
+# }
 
-raw.rename_channels(mapping)      # modifies raw in-place
+#raw.rename_channels(mapping)      # modifies raw in-place
+
 print(raw.ch_names[:20])
 data = raw.get_data()  # shape (n_channels, n_samples)
 labels = raw.ch_names
@@ -125,7 +133,7 @@ raw_filtered.plot(n_channels=20, duration=30, scalings='auto', events=events, ev
 
 # desired epoch length in seconds
 epoch_tmin = 0.0
-epoch_tmax = 0.5
+epoch_tmax = 0.1
 
 print(f"Requested events: {len(events)}. Example events (first 10 rows):\n{events[:10]}")
 print(f"Event ID mapping: {event_id}")
@@ -667,7 +675,7 @@ print("CROPPING STIMULUS ARTIFACT")
 print("="*50)
 
 # Define stimulus artifact duration
-crop_duration_ms = 60 # should be 10.5
+crop_duration_ms = 11 # should be 10.5
 crop_duration_s = crop_duration_ms / 1000.0
 crop_samples = int(np.round(crop_duration_s * sfreq))
 
@@ -1398,12 +1406,214 @@ df = find_first_n_turning_points_per_channel(
     return_dataframe=True
 )
 
+
+# =================================== ITC =====================================
+try:
+    from tensorpac.utils import ITC
+except Exception as exc:
+    raise ImportError("tensorpac is required to run ITC. Install with `pip install tensorpac`") from exc
+
+def compute_itc_tensorpac_all_channels(
+    edata,             # shape (n_epochs, n_channels, n_times)
+    sfreq,             # sampling frequency (Hz)
+    f_pha=[8, 12],     # freq specification: either [fmin, fmax] or array of freqs
+    dcomplex='wavelet',# 'wavelet' or 'hilbert'
+    cycle=3,
+    width=7,
+    edges=None,
+    n_jobs=1,
+    verbose=False
+):
+    """
+    Compute ITC using tensorpac.utils.ITC for all channels.
+    Returns:
+      itc_all: numpy array shaped either
+         (n_channels, n_times) for single band f_pha=[fmin,fmax]
+         or (n_channels, n_freqs, n_times) for multi-frequency f_pha=array_like
+      example_itc_obj_list: list of ITC objects (one per channel) in case you want to plot with tensorpac later
+    """
+    edata = np.asarray(edata)
+    if edata.ndim != 3:
+        raise ValueError("edata must be shape (n_epochs, n_channels, n_times)")
+
+    n_epochs, n_ch, n_times = edata.shape
+    itc_objs = []
+    itc_list = []
+
+    for ch in range(n_ch):
+        x = edata[:, ch, :]  # (n_epochs, n_times)
+        # create ITC object (this computes values inside)
+        itc_obj = ITC(x, sfreq, f_pha=f_pha, dcomplex=dcomplex,
+                      cycle=cycle, width=width, edges=edges,
+                      n_jobs=n_jobs, verbose=verbose)
+        itc_objs.append(itc_obj)
+
+        # Try to extract the numeric ITC results from the object.
+        # The common attribute name is `itc` (freq x time or time).
+        if hasattr(itc_obj, "itc"):
+            vals = np.asarray(itc_obj.itc)
+        # fallbacks if attribute naming changed across versions:
+        elif hasattr(itc_obj, "power"):
+            vals = np.asarray(itc_obj.power)
+        elif hasattr(itc_obj, "data"):
+            vals = np.asarray(itc_obj.data)
+        elif hasattr(itc_obj, "complex"):
+            # compute ITC from complex TFR: mean over trials of phase vectors
+            c = np.asarray(itc_obj.complex)  # (n_epochs, n_freqs, n_times) or (n_epochs, n_times)
+            phase = np.angle(c)
+            vals = np.abs(np.mean(np.exp(1j * phase), axis=0))
+        else:
+            # last resort: call plot() which forces computation but we still need numeric values
+            # raise informative error so user can inspect `dir(itc_obj)`
+            raise RuntimeError(f"Cannot find numeric ITC inside ITC object for channel {ch}. "
+                               f"Inspect attributes: {dir(itc_obj)}")
+
+        # Normalize shapes:
+        vals = np.asarray(vals)
+        if vals.ndim == 1:
+            vals = vals[np.newaxis, :]   # (1, n_times) -> single freq
+        elif vals.ndim == 2:
+            # (n_freqs, n_times) OK
+            pass
+        else:
+            raise RuntimeError(f"Unexpected ITC array shape for channel {ch}: {vals.shape}")
+
+        itc_list.append(vals)
+
+    # stack -> (n_channels, n_freqs, n_times)
+    itc_all = np.stack(itc_list, axis=0)
+    # if single freq (n_freqs == 1) squeeze to (n_channels, n_times)
+    if itc_all.shape[1] == 1:
+        itc_all = itc_all[:, 0, :]
+
+    return itc_all, itc_objs
+
+# Example usage with your cropped epochs:
+# edata_cropped_all is already created and is multiplied by 1e6 earlier (µV)
+# times_cropped_all, sfreq and ch_names are already in scope
+freqs = np.linspace(4, 40, 20)   # example TF frequencies
+itc_tf, itc_objs = compute_itc_tensorpac_all_channels(
+    edata=edata_cropped_all,    # (n_epochs, n_channels, n_times)
+    sfreq=sfreq,
+    f_pha=freqs,                # returns (n_channels, n_freqs, n_times)
+    dcomplex='wavelet',         # use Morlet wavelets for TF
+    width=7,
+    edges=10,
+    n_jobs=1,
+    verbose=False
+)
+
+print("Computed ITC TF array shape:", itc_tf.shape)
+# Quick plot: show ITC time-frequency of channel 0
+ch_idx = 0
+if itc_tf.ndim == 3:
+    plt.figure(figsize=(8, 4))
+    vmax = np.percentile(itc_tf[ch_idx], 98)
+    plt.imshow(itc_tf[ch_idx], aspect='auto', origin='lower',
+               extent=[times_cropped_all[0], times_cropped_all[-1], freqs[0], freqs[-1]],
+               vmin=0, vmax=vmax, cmap='viridis')
+    plt.colorbar(label='ITC')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Frequency (Hz)')
+    plt.title(f'ITC (ch={ch_names[ch_idx]})')
+    plt.axvline(0, color='k', ls='--')
+    plt.show()
+else:
+    # single-band case: itc_tf shape (n_channels, n_times)
+    plt.figure(figsize=(9, 3))
+    plt.plot(times_cropped_all, itc_tf[ch_idx], label=f'ITC {ch_names[ch_idx]}')
+    plt.xlabel('Time (s)')
+    plt.ylabel('ITC (0-1)')
+    plt.title(f'ITC (ch={ch_names[ch_idx]})')
+    plt.axvline(0, color='k', ls='--')
+    plt.ylim(0, 1.0)
+    plt.show()
+
+
+
+def average_itc_per_channel(itc, ch_names, freqs=None, times=None, save_csv_path=None, plot_bar=True):
+    """
+    Compute average ITC per channel and return a sorted DataFrame.
+
+    Parameters
+    ----------
+    itc : np.ndarray
+        ITC array. Either shape (n_channels, n_freqs, n_times) or (n_channels, n_times).
+    ch_names : list[str]
+        Channel names length n_channels.
+    freqs : array_like or None
+        If provided and itc is TF, used for axis labels (optional).
+    times : array_like or None
+        Optional times vector.
+    save_csv_path : str or None
+        If provided, save the table to this CSV path.
+    plot_bar : bool
+        If True, plot a horizontal bar chart of mean ITC sorted descending.
+
+    Returns
+    -------
+    df_sorted : pandas.DataFrame
+        Columns: ['rank', 'channel', 'mean_itc']
+    """
+    itc = np.asarray(itc)
+    n_ch = len(ch_names)
+
+    if itc.ndim == 3:
+        # (n_channels, n_freqs, n_times) -> average across freq & time
+        mean_per_ch = itc.mean(axis=(1,2))
+    elif itc.ndim == 2:
+        # (n_channels, n_times) -> average across time
+        mean_per_ch = itc.mean(axis=1)
+    else:
+        raise ValueError(f"Unexpected ITC array shape: {itc.shape}")
+
+    # Build DataFrame
+    df = pd.DataFrame({
+        'channel': ch_names,
+        'mean_itc': mean_per_ch
+    })
+    df['rank'] = df['mean_itc'].rank(ascending=False, method='min').astype(int)
+    df_sorted = df.sort_values('mean_itc', ascending=False).reset_index(drop=True)
+    # reorder columns
+    df_sorted = df_sorted[['rank', 'channel', 'mean_itc']]
+
+    # print nicely
+    pd.set_option('display.float_format', lambda x: f"{x:.4f}")
+    print("\nAverage ITC per channel (sorted):")
+    print(df_sorted.to_string(index=False))
+
+    # save CSV
+    if save_csv_path:
+        df_sorted.to_csv(save_csv_path, index=False)
+        print(f"\nSaved table to: {save_csv_path}")
+
+    # optional bar plot
+    if plot_bar:
+        plt.figure(figsize=(6, max(3, 0.25 * n_ch)))
+        plt.barh(df_sorted['channel'][::-1], df_sorted['mean_itc'][::-1], color='C0')
+        plt.xlabel('Mean ITC (0-1)')
+        plt.title('Mean ITC per channel')
+        plt.xlim(0, 1.0)
+        plt.tight_layout()
+        plt.show()
+
+    return df_sorted
+
+
+# Example 1: If you computed TF ITC `itc_tf` (freqs array used when computing):
+df_itc = average_itc_per_channel(itc_tf, ch_names, freqs=freqs, times=times_cropped_all,
+                                 save_csv_path='itc_mean_per_channel.csv', plot_bar=True)
+
+# Example 2: If you computed single-band ITC `itc_alpha`:
+# df_itc = average_itc_per_channel(itc_alpha, ch_names,
+#                                  save_csv_path='itc_mean_per_channel_alpha.csv', plot_bar=True)
+
 # ================== GROUP AVERAGING ==================
 print("\n" + "="*50)
 print("AVERAGING EPOCHS IN GROUPS OF 40")
 print("="*50)
 
-group_size = 5
+group_size = 10
 n_good_epochs = edata_cropped_all.shape[0]
 n_groups = int(np.floor(n_good_epochs / group_size))
 remainder = n_good_epochs % group_size
@@ -1455,7 +1665,7 @@ if remainder > 0:
     start_idx = n_groups * group_size
     end_idx = n_good_epochs
     
-    group_data = edata_good[start_idx:end_idx]
+    group_data = edata_cropped_all[start_idx:end_idx]
     group_mean = np.mean(group_data, axis=0)
     
     grouped_averages.append(group_mean)
