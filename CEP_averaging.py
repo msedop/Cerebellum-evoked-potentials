@@ -15,10 +15,11 @@ from typing import Optional, Union, Tuple, List, Dict, Any
 from matplotlib.colors import to_rgb
 import pandas as pd
 
+
 from tensorpac.utils import ITC, PSD
 
 # Specify the full path to your EDF file
-file_path = r"C:\Users\msedo\Documents\Cerebelo\Maria del Carmen Jimenez\13.52_stim.edf"  # Change this to your file path
+file_path = r"C:\Users\msedo\Documents\Cerebelo\Chimula Mark\13.14_stim_2.edf"  # Change this to your file path
 
 raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
 raw.drop_channels( ['Chin+','ECG+','DI+','DD+','RONQ+','CAN+','TER+','PCO2+','EtCO+','Pos+','Tor+','Abd+','TIBI+','TIBD+','thor+','abdo+','PULS+','BEAT+','SpO2+','MKR+'])
@@ -31,20 +32,20 @@ raw.drop_channels([
     'EEG F4', 'EEG Cz'
 ])
 
-# mapping: {old_name: new_name}
-# mapping = {
-#     'EEG F3': 'EEG F1',
-#     'EEG F7': 'EEG F3',
-#     'EEG C3' : 'EEG C1',
-#     'EEG P3' : 'EEG CP1',
-#     'EEG T5' : 'EEG CP3',
-#     'EEG F4' : 'EEG F2',
-#     'EEG F8' : 'EEG F4',
-#     'EEG C4' : 'EEG C2',
-#     'EEG P4' : 'EEG CP2',
-#     'EEG T6' : 'EEG CP4'
 
-# }
+mapping = {
+    'EEG F3': 'EEG F1',
+    'EEG F7': 'EEG F3',
+    'EEG C3' : 'EEG C1',
+    'EEG P3' : 'EEG CP1',
+    'EEG T5' : 'EEG CP3',
+    'EEG F4' : 'EEG F2',
+    'EEG F8' : 'EEG F4',
+    'EEG C4' : 'EEG C2',
+    'EEG P4' : 'EEG CP2',
+    'EEG T6' : 'EEG CP4'
+
+}
 
 #raw.rename_channels(mapping)      # modifies raw in-place
 
@@ -133,7 +134,7 @@ raw_filtered.plot(n_channels=20, duration=30, scalings='auto', events=events, ev
 
 # desired epoch length in seconds
 epoch_tmin = 0.0
-epoch_tmax = 0.1
+epoch_tmax = 0.2
 
 print(f"Requested events: {len(events)}. Example events (first 10 rows):\n{events[:10]}")
 print(f"Event ID mapping: {event_id}")
@@ -668,6 +669,83 @@ plot_channel_means_with_envelope_same_color_ms(
     return_fig_ax=False
 )
 
+# # ========================== Stimulus artifact subtraction ====================
+
+# # Helper: define artifact window and taper
+# ms_window = 50.0                          # artifact duration in milliseconds (change if needed)
+# artifact_mask = (times * 1000.0 >= 0) & (times * 1000.0 <= ms_window)   # boolean mask over time samples
+
+# # optional taper to avoid steps (Hann / cosine taper over artifact edges)
+# def make_taper(mask, taper_len_samples=5):
+#     """
+#     mask : boolean array over time
+#     taper_len_samples : how many samples to taper at each edge (int)
+#     returns a 1D array (n_times,) with 1 inside mask and taper to 0 at edges
+#     """
+#     n = len(mask)
+#     w = np.zeros(n, dtype=float)
+#     idx = np.where(mask)[0]
+#     if idx.size == 0:
+#         return w
+#     start, end = idx[0], idx[-1]
+#     core = np.arange(start + taper_len_samples, end - taper_len_samples + 1)
+#     if core.size > 0:
+#         w[core] = 1.0
+#     # left taper
+#     left = np.arange(start, min(start + taper_len_samples, end + 1))
+#     if left.size:
+#         w[left] = 0.5 * (1 - np.cos(np.linspace(0, np.pi, left.size)))
+#     # right taper
+#     right = np.arange(max(end - taper_len_samples + 1, start), end + 1)
+#     if right.size:
+#         w[right] = 0.5 * (1 - np.cos(np.linspace(np.pi, 2*np.pi, right.size)))
+#     return w
+
+# taper = make_taper(artifact_mask, taper_len_samples=max(1, int(0.002 * sfreq)))  # e.g., 2 ms taper
+
+# # edata: shape (n_epochs, n_channels, n_times) in Volts
+# edata = epochs.get_data()   # ensure you use the current epochs
+# n_epochs, n_ch, n_t = edata.shape
+
+# # compute per-channel artifact as mean across epochs (shape: n_channels x n_times)
+# artifact_per_channel = np.nanmean(edata[:, :, :], axis=0)  # (n_channels, n_times)
+
+# # if you want to only remove in artifact window, multiply artifact by mask/taper
+# artifact_mask_2d = artifact_per_channel * taper[np.newaxis, :]   # shape (n_channels, n_times)
+
+# # subtract artifact from each epoch (channel-wise)
+# edata_corrected = edata - artifact_mask_2d[np.newaxis, :, :]
+
+# # build a new EpochsArray with same info, events, event_id, tmin
+# epochs_clean = mne.EpochsArray(edata_corrected, info=epochs.info.copy(), tmin=epochs.tmin,
+#                                events=getattr(epochs, 'events', None),
+#                                event_id=getattr(epochs, 'event_id', None), verbose=False)
+
+# # quick check: compare evoked before/after
+# evoked_before = epochs.average()
+# evoked_after = epochs_clean.average()
+
+# # plot comparison for a channel index (e.g., 0)
+# ch_idx = 0
+# plt.figure(figsize=(8,4))
+# plt.plot(times*1000, evoked_before.data[ch_idx]*1e6, label='Before (µV)')
+# plt.plot(times*1000, evoked_after.data[ch_idx]*1e6, label='After (µV)')
+# plt.axvspan(0, ms_window, color='red', alpha=0.1, label='Artifact window')
+# plt.xlabel('Time (ms)')
+# plt.ylabel('Amplitude (µV)')
+# plt.title(f'Channel {epochs.ch_names[ch_idx]} - evoked before vs after artifact subtraction')
+# plt.legend()
+# plt.show()
+
+
+# # use cleaned epochs to compute downstream results
+# edata_clean = epochs_clean_scaled.get_data()   # or epochs_clean.get_data() etc.
+
+# # If you later crop the first N samples, do it after cleaning
+# crop_duration_ms = 60
+# crop_samples = int(round(crop_duration_ms / 1000.0 * sfreq))
+# edata_cropped_all = edata_clean[:, :, crop_samples:] * 1e6   # use µV for your other code
+# times_cropped_all = epochs_clean_scaled.times[crop_samples:] - epochs_clean_scaled.times[crop_samples]  # start at 0.0
 
 # ================== CROP STIMULUS ARTIFACT ==================
 print("\n" + "="*50)
@@ -675,7 +753,7 @@ print("CROPPING STIMULUS ARTIFACT")
 print("="*50)
 
 # Define stimulus artifact duration
-crop_duration_ms = 11 # should be 10.5
+crop_duration_ms = 100 # should be 10.5
 crop_duration_s = crop_duration_ms / 1000.0
 crop_samples = int(np.round(crop_duration_s * sfreq))
 
@@ -1613,7 +1691,7 @@ print("\n" + "="*50)
 print("AVERAGING EPOCHS IN GROUPS OF 40")
 print("="*50)
 
-group_size = 10
+group_size = 100
 n_good_epochs = edata_cropped_all.shape[0]
 n_groups = int(np.floor(n_good_epochs / group_size))
 remainder = n_good_epochs % group_size
