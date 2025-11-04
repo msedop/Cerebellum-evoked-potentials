@@ -3,7 +3,6 @@
 
 @author: marti
 """
-
 import pyedflib
 import numpy as np
 import matplotlib.pyplot as plt
@@ -14,141 +13,740 @@ import os
 from typing import Optional, Union, Tuple, List, Dict, Any
 from matplotlib.colors import to_rgb
 import pandas as pd
-
 from tensorpac.utils import ITC, PSD
 
-# Specify the full path to your EDF file
-file_path = r"C:\Users\marti\Documents\HSJD\CCEPs\Martin Garcia\CCEPs_13.20.edf"  # Change this to your file path
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
+base_path = r"C:\Users\marti\Documents\HSJD\CCEPs\Martin Garcia"
 
-raw.drop_channels( ['Chin+','ECG+','DI+','DD+','RONQ+','CAN+','TER+','PCO2+','EtCO+','Pos+','Tor+','Abd+','TIBI+','TIBD+','thor+','abdo+','PULS+','BEAT+','SpO2+','MKR+'])
-raw.drop_channels(['EEG EOGI', 'EEG O1', 'EEG EOGD', 'EEG O2', 'EEG A1', 'EEG A2'])
+# List of EDF files to process (in temporal order)
+edf_files = [
+    'CCEPs_13.10.edf',
+    'CCEPs_13.14.edf',
+    'CCEPs_13.20.edf'
+]
 
-raw.drop_channels([
-    'EEG P4', 'EEG T6'
-])
+# Channels to drop (non-EEG)
+channels_to_drop_physio = ['Chin+','ECG+','DI+','DD+','RONQ+','CAN+','TER+','PCO2+',
+                            'EtCO+','Pos+','Tor+','Abd+','TIBI+','TIBD+','thor+',
+                            'abdo+','PULS+','BEAT+','SpO2+','MKR+']
 
-# mapping: {old_name: new_name}
-# mapping = {
-#     'EEG F3': 'EEG F1',
-#     'EEG F7': 'EEG F3',
-#     'EEG C3' : 'EEG C1',
-#     'EEG P3' : 'EEG CP1',
-#     'EEG T5' : 'EEG CP3',
-#     'EEG F4' : 'EEG F2',
-#     'EEG F8' : 'EEG F4',
-#     'EEG C4' : 'EEG C2',
-#     'EEG P4' : 'EEG CP2',
-#     'EEG T6' : 'EEG CP4'
+# Channels to drop (unwanted EEG)
+channels_to_drop_eeg = ['EEG EOGI', 'EEG O1', 'EEG EOGD', 'EEG O2', 'EEG A1', 'EEG A2']
 
-# }
+# Channels to drop (specific)
+channels_to_drop_specific = ['EEG P4', 'EEG T6']
 
-#raw.rename_channels(mapping)      # modifies raw in-place
+# All channels to drop
+channels_to_drop_all = channels_to_drop_physio + channels_to_drop_eeg + channels_to_drop_specific
 
-print(raw.ch_names[:20])
-data = raw.get_data()  # shape (n_channels, n_samples)
-labels = raw.ch_names
-sfreq = float(raw.info['sfreq'])
-signals = [data[i].astype(np.float64) for i in range(data.shape[0])]
-sample_frequencies = [sfreq for _ in labels]
-units = ['' for _ in labels]
+# Filtering parameters
+l_freq = 0.3   # high-pass cutoff (Hz)
+h_freq = 70.0  # low-pass cutoff (Hz)
 
-
-# ------------------ Filtering -------------------------------------------------
-l_freq = 0.3                  # high-pass cutoff (Hz); set None to disable
-h_freq = 70.0                 # low-pass cutoff (Hz); set None to disable
-
-# Apply bandpass
-raw_filtered = raw.copy().filter(l_freq=l_freq, h_freq=h_freq, picks=None, fir_design='firwin', verbose=False)
-
-# Get filtered data and optionally convert to µV (MNE typically returns Volts)
-filt_data = raw_filtered.get_data()  # shape: (n_eeg, n_samples) in µV
-filt_signals = [filt_data[i].astype(np.float64) for i in range(filt_data.shape[0])]
-
-raw_data = raw.get_data()
-raw_signals = [raw_data[i].astype(np.float64) for i in range(raw_data.shape[0])]
-
-# Use the 2D array 'data' directly (n_channels, n_samples)
-n_signals, n_samples = raw_data.shape
-duration_mins = n_samples / (sfreq * 60)
-
-print(f"Sampling frequency: {sfreq} Hz")
-print(f"Number of EEG channels: {n_signals}")
-print(f"Recording duration: {duration_mins:.2f} min\n")
-
-# -----------------------------Re-referencing------------------------------------
-'''
-def reref_to_channel_numpy(data_uv, channel_labels, ref_name):
-    """
-    data_uv: ndarray (n_ch, n_samples) in µV
-    channel_labels: list of labels length n_ch
-    ref_name: channel label to use as reference (string)
-    returns: data_reref (same shape) = data_uv - reference_channel
-    """
-    if ref_name not in channel_labels:
-        raise ValueError(f"Reference channel {ref_name} not found in channel_labels")
-    ref_idx = channel_labels.index(ref_name)
-    ref_signal = data_uv[ref_idx:ref_idx+1, :]   # shape (1, n_samples)
-    return data_uv - ref_signal                 # broadcasting subtracts ref from every channel
-
-# usage:
-filt_data = reref_to_channel_numpy(filt_data, eeg_labels, ref_name='EEG Pz')
-raw_data = reref_to_channel_numpy(raw_data, eeg_labels, ref_name='EEG Pz')
-'''
-# ----------------------- Rewriting labels to same event ---------------------------------
-
-# set the unified label you want for all events
-new_label = 'STIM'   # choose any string you prefer (no spaces recommended)
-
-# get existing annotations (onset, duration, description, orig_time)
-anns = raw_filtered.annotations
-print("Original unique annotation descriptions:", np.unique(anns.description))
-
-# create new Annotations object with the same onsets/durations but unified descriptions
-unified_descriptions = [new_label] * len(anns)
-new_anns = mne.Annotations(onset=anns.onset,
-                           duration=anns.duration,
-                           description=unified_descriptions,
-                           orig_time=anns.orig_time)
-
-# attach to raw_filtered (overwrites previous annotations)
-raw_filtered.set_annotations(new_anns)
-print("Rewrote annotations. New unique descriptions:", np.unique(raw_filtered.annotations.description))
-
-# now generate events / event_id from the new annotations
-events, event_id = mne.events_from_annotations(raw_filtered)
-print("event_id mapping:", event_id)
-print("First 10 events:\n", events[:10])
-
-# Launch interactive viewer with events displayed
-# duration controls how many seconds are visible at once
-raw_filtered.plot(n_channels=20, duration=30, scalings='auto', events=events, event_id=event_id)
-
-#-------------------------- Rename events ------------------------------------
-
-# --- create 0.5-second epochs starting at each event onset ---
-
-# desired epoch length in seconds
+# Epoching parameters
 epoch_tmin = 0.0
-epoch_tmax = 0.2
+epoch_tmax = 0.22
 
-print(f"Requested events: {len(events)}. Example events (first 10 rows):\n{events[:10]}")
-print(f"Event ID mapping: {event_id}")
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def extract_time_from_filename(filename: str) -> Tuple[int, int]:
+    """
+    Extract hour and minute from filename like 'CCEPs_13.10.edf'
+    Returns: (hour, minute)
+    """
+    base = filename.replace('.edf', '').replace('CCEPs_', '')
+    parts = base.split('.')
+    return int(parts[0]), int(parts[1])
+
+def preprocess_raw(raw: mne.io.Raw, channels_to_drop: List[str]) -> mne.io.Raw:
+    """
+    Drop specified channels and return the preprocessed raw object.
+    """
+    # Drop non-EEG channels
+    channels_available = raw.ch_names
+    channels_to_drop_valid = [ch for ch in channels_to_drop if ch in channels_available]
+    
+    if channels_to_drop_valid:
+        raw.drop_channels(channels_to_drop_valid)
+    
+    return raw
+
+def set_standard_montage(raw: mne.io.Raw) -> mne.io.Raw:
+    """
+    Attach standard 10-20 montage to raw object.
+    """
+    std = mne.channels.make_standard_montage('standard_1020')
+    std_pos = std.get_positions()['ch_pos']
+    
+    ch_pos = {}
+    missing = []
+    for ch in raw.ch_names:
+        std_name = ch.replace('EEG ', '').strip()
+        if std_name in std_pos:
+            ch_pos[ch] = std_pos[std_name]
+        else:
+            missing.append(ch)
+    
+    if len(ch_pos) == 0:
+        raise RuntimeError("No channels matched the standard 10-20 names. Check channel labels.")
+    
+    montage_subset = mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame='head')
+    raw.set_montage(montage_subset)
+    
+    return raw, missing
+
+def create_epochs_from_file(
+    file_path: str,
+    l_freq: float,
+    h_freq: float,
+    epoch_tmin: float,
+    epoch_tmax: float,
+    verbose: bool = False
+) -> Tuple[mne.Epochs, np.ndarray, mne.io.Raw]:
+    """
+    Load an EDF file, preprocess, filter, and create epochs.
+    
+    Returns:
+        epochs: mne.Epochs object
+        edata: raw epoch data (n_epochs, n_channels, n_times)
+        raw_filtered: preprocessed raw object
+    """
+    # Load raw data
+    raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
+    
+    # Preprocess: drop channels
+    raw = preprocess_raw(raw, channels_to_drop_all)
+    
+    # Set montage BEFORE filtering
+    raw, missing = set_standard_montage(raw)
+    
+    # Filter
+    raw_filtered = raw.copy().filter(l_freq=l_freq, h_freq=h_freq, 
+                                      picks=None, fir_design='firwin', verbose=False)
+    
+    # Get annotations and create unified events
+    anns = raw_filtered.annotations
+    new_label = 'STIM'
+    unified_descriptions = [new_label] * len(anns)
+    new_anns = mne.Annotations(onset=anns.onset,
+                               duration=anns.duration,
+                               description=unified_descriptions,
+                               orig_time=anns.orig_time)
+    raw_filtered.set_annotations(new_anns)
+    
+    # Get events
+    events, event_id = mne.events_from_annotations(raw_filtered)
+    
+    if verbose:
+        print(f"File: {file_path}")
+        print(f"  Channels: {raw_filtered.ch_names}")
+        print(f"  Events found: {len(events)}")
+        if missing:
+            print(f"  Missing from montage: {missing}")
+        print(f"  Event ID: {event_id}\n")
+    
+    # Create epochs
+    epochs = mne.Epochs(raw_filtered, events, event_id=event_id,
+                        tmin=epoch_tmin, tmax=epoch_tmax, baseline=None, 
+                        preload=True, verbose=False)
+    
+    edata = epochs.get_data()
+    
+    return epochs, edata, raw_filtered
+
+# ============================================================================
+# MAIN PROCESSING
+# ============================================================================
+
+# Sort files by time
+file_info = [(f, extract_time_from_filename(f)) for f in edf_files]
+file_info_sorted = sorted(file_info, key=lambda x: (x[1][0], x[1][1]))
+edf_files_sorted = [f[0] for f in file_info_sorted]
+
+print("=" * 80)
+print("LOADING AND PREPROCESSING EDF FILES")
+print("=" * 80)
+print(f"Files to process (in temporal order):")
+for idx, (fname, (hour, minute)) in enumerate(file_info_sorted):
+    print(f"  {idx+1}. {fname} ({hour:02d}:{minute:02d})")
+print()
+
+# Load and process each file
+all_epochs_list = []
+all_raw_filtered_list = []
+sfreq = None
+ch_names = None
+times = None
+
+for file_idx, fname in enumerate(edf_files_sorted):
+    file_path = os.path.join(base_path, fname)
+    
+    if not os.path.exists(file_path):
+        print(f"WARNING: File not found: {file_path}")
+        continue
+    
+    print(f"Processing file {file_idx + 1}/{len(edf_files_sorted)}: {fname}")
+    
+    try:
+        epochs, edata, raw_filtered = create_epochs_from_file(
+            file_path, l_freq, h_freq, epoch_tmin, epoch_tmax, verbose=True
+        )
+        
+        all_epochs_list.append(epochs)
+        all_raw_filtered_list.append(raw_filtered)
+        
+        # Store sampling frequency and channel names from first file
+        if sfreq is None:
+            sfreq = float(raw_filtered.info['sfreq'])
+            ch_names = list(raw_filtered.ch_names)
+            times = epochs.times
+        
+        print(f"  ✓ Successfully loaded: {edata.shape[0]} epochs, {edata.shape[1]} channels, {edata.shape[2]} timepoints")
+        print(f"  ✓ Sampling frequency: {sfreq} Hz")
+        print(f"  ✓ Channels: {ch_names}\n")
+        
+    except Exception as e:
+        print(f"  ✗ ERROR processing {fname}: {str(e)}\n")
+        import traceback
+        traceback.print_exc()
+        continue
+
+# Check that all files were successfully loaded
+if not all_epochs_list:
+    raise RuntimeError("No files were successfully loaded!")
+
+print(f"\nSuccessfully loaded {len(all_epochs_list)} files")
+
+# ============================================================================
+# MERGE EPOCHS ACROSS FILES
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("MERGING EPOCHS ACROSS FILES")
+print("=" * 80)
+
+# Concatenate all epochs objects
+merged_epochs = mne.concatenate_epochs(all_epochs_list, verbose=False)
+
+# Re-apply montage after concatenation (since it may be lost)
+if all_raw_filtered_list:
+    first_raw = all_raw_filtered_list[0]
+    merged_epochs.set_montage(first_raw.get_montage())
+
+# Get merged epoch data
+merged_edata = merged_epochs.get_data()
+n_epochs_merged, n_channels, n_times = merged_edata.shape
+
+print(f"\nMerged epochs shape: {merged_edata.shape}")
+print(f"  Total epochs: {n_epochs_merged}")
+print(f"  Channels: {n_channels}")
+print(f"  Timepoints per epoch: {n_times}")
+print(f"  Channel names: {list(merged_epochs.ch_names)}")
+
+# Convert to µV if needed
+if np.nanmax(np.abs(merged_edata)) < 1e-2:
+    merged_edata_uV = merged_edata * 1e6
+else:
+    merged_edata_uV = merged_edata.copy()
 
 
-# Create epochs: start at event (tmin=0.0) and last 4 seconds (tmax=4.0)
-epochs = mne.Epochs(raw_filtered, events, event_id=event_id,
-                    tmin=epoch_tmin, tmax=epoch_tmax, baseline=None, preload=True, verbose=False)
+# ============================================================================
+# ADVANCED ARTIFACT REJECTION: DETECT OSCILLATORY ARTIFACTS
+# ============================================================================
 
-# epoch data shape: (n_epochs, n_channels, n_times)
-edata = epochs.get_data()
-n_epochs, n_channels, n_times = edata.shape
-epoch_duration_s = (n_times - 1) / sfreq  # approximate
-print(f"Epochs shape: {edata.shape} (n_epochs, n_channels, n_times). epoch_duration ≈ {epoch_duration_s:.3f} s")
+print("\n" + "=" * 80)
+print("ADVANCED ARTIFACT REJECTION: OSCILLATORY ARTIFACTS")
+print("=" * 80)
 
-# If you want epoch data in microvolts (µV):
-edata_uV = edata * 1e6
+from scipy import signal
+from scipy.fft import fft, fftfreq
+
+def detect_oscillatory_artifacts(edata, sfreq, verbose=True):
+    """
+    Detect epochs with strong oscillatory activity (sine-like waves).
+    Uses multiple criteria:
+    1. Spectral power in high-frequency bands
+    2. Kurtosis (peakedness) - artifacts are more peaked/sinusoidal
+    3. Zero-crossing rate - artifacts have regular zero crossings
+    4. Variance - compare variance across time windows
+    
+    Parameters:
+    -----------
+    edata : ndarray (n_epochs, n_channels, n_times)
+        Epoch data in µV
+    sfreq : float
+        Sampling frequency in Hz
+    verbose : bool
+        Print detailed information
+    
+    Returns:
+    --------
+    artifact_scores : ndarray (n_epochs,)
+        Artifact score for each epoch (0-1, higher = more artifact-like)
+    good_epoch_indices : ndarray
+        Indices of epochs with low artifact scores
+    artifact_epoch_indices : ndarray
+        Indices of epochs with high artifact scores
+    artifact_details : dict
+        Detailed breakdown of artifact metrics
+    """
+    from scipy.stats import kurtosis
+    
+    n_epochs, n_channels, n_times = edata.shape
+    
+    # Initialize score arrays
+    spectral_scores = np.zeros(n_epochs)
+    kurtosis_scores = np.zeros(n_epochs)
+    zero_cross_scores = np.zeros(n_epochs)
+    variance_scores = np.zeros(n_epochs)
+    
+    # Compute metrics for each epoch
+    for ep in range(n_epochs):
+        epoch_data = edata[ep]  # shape: (n_channels, n_times)
+        
+        # ===== METRIC 1: Spectral Power in High Frequencies =====
+        # Artifacts often have concentrated power in specific narrow bands
+        freqs = np.fft.fftfreq(n_times, 1/sfreq)
+        pos_freqs_idx = freqs > 0
+        
+        spectral_powers = np.zeros((n_channels, n_times // 2))
+        for ch in range(n_channels):
+            fft_data = np.fft.fft(epoch_data[ch])
+            power = np.abs(fft_data[pos_freqs_idx]) ** 2
+            spectral_powers[ch, :len(power)] = power
+        
+        # Look for concentration of power (high peakedness in spectrum)
+        mean_power = np.mean(spectral_powers)
+        max_power = np.max(spectral_powers)
+        spectral_scores[ep] = max_power / (mean_power + 1e-10)  # Peak-to-mean ratio
+        
+        # ===== METRIC 2: Kurtosis (Peak-like quality) =====
+        # Sinusoids have lower kurtosis than normal EEG; artifacts may have distinct patterns
+        kurts = np.array([kurtosis(epoch_data[ch]) for ch in range(n_channels)])
+        kurtosis_scores[ep] = np.mean(kurts)
+        
+        # ===== METRIC 3: Zero-Crossing Rate =====
+        # Regular sinusoids have very consistent zero-crossing rates
+        zcr_vals = []
+        for ch in range(n_channels):
+            zero_crossings = np.sum(np.abs(np.diff(np.sign(epoch_data[ch])))) / 2
+            zcr_vals.append(zero_crossings / n_times)
+        zero_cross_scores[ep] = np.std(zcr_vals)  # Low std = regular pattern
+        
+        # ===== METRIC 4: Variance consistency across windows =====
+        # Artifacts have consistent amplitude across time; neural response varies
+        window_size = n_times // 4  # Divide epoch into 4 windows
+        window_vars = []
+        for w in range(4):
+            start = w * window_size
+            end = (w + 1) * window_size if w < 3 else n_times
+            window_var = np.var(epoch_data[:, start:end])
+            window_vars.append(window_var)
+        
+        variance_scores[ep] = 1.0 - (np.std(window_vars) / (np.mean(window_vars) + 1e-10))
+    
+    # Normalize scores to 0-1 range
+    spectral_scores = (spectral_scores - np.min(spectral_scores)) / (np.max(spectral_scores) - np.min(spectral_scores) + 1e-10)
+    kurtosis_scores = (kurtosis_scores - np.min(kurtosis_scores)) / (np.max(kurtosis_scores) - np.min(kurtosis_scores) + 1e-10)
+    zero_cross_scores = (zero_cross_scores - np.min(zero_cross_scores)) / (np.max(zero_cross_scores) - np.min(zero_cross_scores) + 1e-10)
+    variance_scores = (variance_scores - np.min(variance_scores)) / (np.max(variance_scores) - np.min(variance_scores) + 1e-10)
+    
+    # Combine scores with weights
+    weights = {'spectral': 0.35, 'kurtosis': 0.25, 'zero_cross': 0.25, 'variance': 0.15}
+    artifact_scores = (weights['spectral'] * spectral_scores + 
+                      weights['kurtosis'] * kurtosis_scores +
+                      weights['zero_cross'] * zero_cross_scores +
+                      weights['variance'] * variance_scores)
+    
+    # Adaptive threshold using percentile (top 20% are considered artifacts)
+    threshold = np.percentile(artifact_scores, 80)
+    
+    good_epoch_indices = np.where(artifact_scores <= threshold)[0]
+    artifact_epoch_indices = np.where(artifact_scores > threshold)[0]
+    
+    artifact_details = {
+        'spectral_scores': spectral_scores,
+        'kurtosis_scores': kurtosis_scores,
+        'zero_cross_scores': zero_cross_scores,
+        'variance_scores': variance_scores,
+        'combined_scores': artifact_scores,
+        'threshold': threshold,
+        'n_good': len(good_epoch_indices),
+        'n_artifact': len(artifact_epoch_indices),
+        'percent_good': 100 * len(good_epoch_indices) / n_epochs,
+        'percent_artifact': 100 * len(artifact_epoch_indices) / n_epochs,
+    }
+    
+    if verbose:
+        print(f"\nOscillatory Artifact Detection Results:")
+        print(f"  Total epochs: {n_epochs}")
+        print(f"  Good epochs: {artifact_details['n_good']} ({artifact_details['percent_good']:.1f}%)")
+        print(f"  Artifact epochs: {artifact_details['n_artifact']} ({artifact_details['percent_artifact']:.1f}%)")
+        print(f"  Artifact score threshold: {threshold:.3f}")
+        print(f"\nArtifact Score Ranges (normalized 0-1):")
+        print(f"  Spectral: mean={np.mean(spectral_scores):.3f}, std={np.std(spectral_scores):.3f}")
+        print(f"  Kurtosis: mean={np.mean(kurtosis_scores):.3f}, std={np.std(kurtosis_scores):.3f}")
+        print(f"  Zero-crossing: mean={np.mean(zero_cross_scores):.3f}, std={np.std(zero_cross_scores):.3f}")
+        print(f"  Variance consistency: mean={np.mean(variance_scores):.3f}, std={np.std(variance_scores):.3f}")
+    
+    return artifact_scores, good_epoch_indices, artifact_epoch_indices, artifact_details
+
+# ============================================================================
+# RUN OSCILLATORY ARTIFACT DETECTION
+# ============================================================================
+
+artifact_scores, good_indices, artifact_indices, details = detect_oscillatory_artifacts(
+    merged_edata_uV,
+    sfreq=sfreq,
+    verbose=True
+)
+
+# ============================================================================
+# VISUALIZATION 1: ARTIFACT SCORE DISTRIBUTION
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("CREATING VISUALIZATIONS")
+print("=" * 80)
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+# Plot 1: Combined artifact score histogram
+ax = axes[0, 0]
+ax.hist(artifact_scores, bins=50, color='C0', alpha=0.7, edgecolor='black')
+ax.axvline(details['threshold'], color='r', linestyle='--', linewidth=2.5, 
+           label=f'Threshold ({details["threshold"]:.3f})')
+ax.set_xlabel('Combined Artifact Score', fontsize=11)
+ax.set_ylabel('Number of Epochs', fontsize=11)
+ax.set_title('Artifact Score Distribution', fontsize=12, fontweight='bold')
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+# Plot 2: Score components over time
+ax = axes[0, 1]
+epoch_nums = np.arange(len(artifact_scores))
+ax.scatter(epoch_nums[good_indices], artifact_scores[good_indices], 
+           color='g', alpha=0.6, s=30, label=f'Good (n={len(good_indices)})')
+ax.scatter(epoch_nums[artifact_indices], artifact_scores[artifact_indices], 
+           color='r', alpha=0.6, s=30, label=f'Artifact (n={len(artifact_indices)})')
+ax.axhline(details['threshold'], color='r', linestyle='--', linewidth=2, alpha=0.7)
+ax.set_xlabel('Epoch Index', fontsize=11)
+ax.set_ylabel('Combined Artifact Score', fontsize=11)
+ax.set_title('Artifact Score vs Epoch Number', fontsize=12, fontweight='bold')
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+# Plot 3: Individual score components
+ax = axes[1, 0]
+component_names = ['Spectral', 'Kurtosis', 'Zero-Cross', 'Variance']
+component_good = [
+    np.mean(details['spectral_scores'][good_indices]),
+    np.mean(details['kurtosis_scores'][good_indices]),
+    np.mean(details['zero_cross_scores'][good_indices]),
+    np.mean(details['variance_scores'][good_indices]),
+]
+component_artifact = [
+    np.mean(details['spectral_scores'][artifact_indices]),
+    np.mean(details['kurtosis_scores'][artifact_indices]),
+    np.mean(details['zero_cross_scores'][artifact_indices]),
+    np.mean(details['variance_scores'][artifact_indices]),
+]
+
+x_pos = np.arange(len(component_names))
+width = 0.35
+ax.bar(x_pos - width/2, component_good, width, label='Good', color='g', alpha=0.7)
+ax.bar(x_pos + width/2, component_artifact, width, label='Artifact', color='r', alpha=0.7)
+ax.set_ylabel('Mean Score', fontsize=11)
+ax.set_title('Average Scores by Component', fontsize=12, fontweight='bold')
+ax.set_xticks(x_pos)
+ax.set_xticklabels(component_names)
+ax.legend()
+ax.grid(True, alpha=0.3, axis='y')
+
+# Plot 4: Box plots of individual components
+ax = axes[1, 1]
+data_to_plot = [
+    details['spectral_scores'][good_indices],
+    details['spectral_scores'][artifact_indices],
+    details['kurtosis_scores'][good_indices],
+    details['kurtosis_scores'][artifact_indices],
+]
+bp = ax.boxplot(data_to_plot, labels=['Spectral\n(Good)', 'Spectral\n(Artifact)', 
+                                       'Kurtosis\n(Good)', 'Kurtosis\n(Artifact)'],
+                patch_artist=True)
+for i, box in enumerate(bp['boxes']):
+    box.set_facecolor('g' if i % 2 == 0 else 'r')
+    box.set_alpha(0.7)
+ax.set_ylabel('Score', fontsize=11)
+ax.set_title('Score Distributions (Good vs Artifact)', fontsize=12, fontweight='bold')
+ax.grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================================
+# VISUALIZATION 2: COMPARE GOOD AND ARTIFACT EPOCHS
+# ============================================================================
+
+fig, axes = plt.subplots(2, 1, figsize=(14, 8))
+n_ch = n_channels
+
+# Find most representative good and artifact epochs
+if len(good_indices) > 0:
+    good_epoch_idx = good_indices[np.argmin(artifact_scores[good_indices])]
+else:
+    good_epoch_idx = 0
+
+if len(artifact_indices) > 0:
+    artifact_epoch_idx = artifact_indices[np.argmax(artifact_scores[artifact_indices])]
+else:
+    artifact_epoch_idx = 0
+
+cmap = plt.get_cmap('tab20')
+colors = cmap(np.linspace(0, 1, n_ch))
+
+# Plot good epoch
+ax = axes[0]
+for ch in range(n_ch):
+    ax.plot(times * 1000, merged_edata_uV[good_epoch_idx, ch, :], 
+            color=colors[ch], alpha=0.7, lw=1.2, label=ch_names[ch])
+ax.set_title(f"Example GOOD Epoch (Index {good_epoch_idx}, Score: {artifact_scores[good_epoch_idx]:.3f})", 
+             fontsize=12, fontweight='bold', color='green')
+ax.axvline(0, color='k', linestyle='--', alpha=0.5)
+ax.grid(True, alpha=0.3)
+ax.set_ylabel('µV')
+ax.legend(loc='upper right', fontsize=8, ncol=3)
+
+# Plot artifact epoch
+ax = axes[1]
+for ch in range(n_ch):
+    ax.plot(times * 1000, merged_edata_uV[artifact_epoch_idx, ch, :], 
+            color=colors[ch], alpha=0.7, lw=1.2, label=ch_names[ch])
+ax.set_title(f"Example ARTIFACT Epoch (Index {artifact_epoch_idx}, Score: {artifact_scores[artifact_epoch_idx]:.3f})", 
+             fontsize=12, fontweight='bold', color='red')
+ax.axvline(0, color='k', linestyle='--', alpha=0.5)
+ax.grid(True, alpha=0.3)
+ax.set_ylabel('µV')
+ax.set_xlabel('Time (ms)')
+ax.legend(loc='upper right', fontsize=8, ncol=3)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================================
+# VISUALIZATION 3: SPECTRAL COMPARISON
+# ============================================================================
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+freq_range = (0, 100)  # Hz
+
+for idx, (ax, epoch_idx, label, color) in enumerate([
+    (axes[0], good_epoch_idx, 'GOOD', 'green'),
+    (axes[1], artifact_epoch_idx, 'ARTIFACT', 'red')
+]):
+    
+    # Average power spectrum across channels
+    power_spectra = []
+    for ch in range(n_ch):
+        signal_ch = merged_edata_uV[epoch_idx, ch, :]
+        freqs = np.fft.fftfreq(len(signal_ch), 1/sfreq)
+        fft_vals = np.fft.fft(signal_ch)
+        power = np.abs(fft_vals) ** 2
+        
+        # Keep only positive frequencies
+        pos_idx = freqs > 0
+        freqs_pos = freqs[pos_idx]
+        power_pos = power[pos_idx]
+        
+        power_spectra.append(power_pos)
+    
+    # Average across channels
+    avg_power = np.mean(power_spectra, axis=0)
+    freqs_pos_mean = freqs[freqs > 0][:len(avg_power)]
+    
+    ax.semilogy(freqs_pos_mean, avg_power, color=color, linewidth=2)
+    ax.set_xlim(freq_range)
+    ax.set_xlabel('Frequency (Hz)', fontsize=11)
+    ax.set_ylabel('Power (µV²)', fontsize=11)
+    ax.set_title(f'{label} Epoch - Power Spectrum\n(Score: {artifact_scores[epoch_idx]:.3f})', 
+                 fontsize=12, fontweight='bold', color=color)
+    ax.grid(True, alpha=0.3, which='both')
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================================
+# CREATE CLEANED DATASET
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("CREATING CLEANED DATASET")
+print("=" * 80)
+
+print(f"\nOriginal data shape: {merged_edata_uV.shape}")
+# Filter epochs
+merged_edata_uV = merged_edata_uV[good_indices]
+merged_edata = merged_edata_uV/1e6
+merged_epochs = merged_epochs[good_indices]
+n_epochs_merged, n_channels, n_times = merged_edata_uV.shape
+
+print(f"Cleaned data shape: {merged_edata_uV.shape}")
+print(f"Removed {len(artifact_indices)} epochs ({details['percent_artifact']:.1f}%)")
+
+
+# ============================================================================
+# VISUALIZATION 1: PER-CHANNEL MEAN ACROSS ALL MERGED EPOCHS
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("CREATING VISUALIZATIONS")
+print("=" * 80)
+
+# Calculate per-channel mean across all epochs
+mean_per_channel = np.nanmean(merged_edata_uV, axis=0)  # (n_channels, n_times)
+
+# Plot 1: Mean signal per channel
+n_cols = 6
+n_rows = int(math.ceil(n_channels / n_cols))
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(3*n_cols, 2.2*n_rows), sharex=True)
+axes = axes.ravel()
+
+for i in range(n_channels):
+    ax = axes[i]
+    ax.plot(times, mean_per_channel[i], color='C0', lw=1.5)
+    ax.axvline(0.0, color='k', linestyle='--', alpha=0.6)
+    ax.axhline(0, color='k', linestyle='-', alpha=0.4, linewidth=0.8)
+    ax.set_title(ch_names[i], fontsize=8)
+    if i % n_cols == 0:
+        ax.set_ylabel('µV')
+    ax.set_xlim(times[0], times[-1])
+    ax.grid(True, alpha=0.3)
+
+for ax in axes[n_channels:]:
+    ax.axis('off')
+
+fig.suptitle(f"Merged Data: Per-channel mean across all {n_epochs_merged} epochs (µV)", fontsize=12)
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.show()
+
+# ============================================================================
+# VISUALIZATION 2: ALL EPOCHS PER CHANNEL (OVERLAY WITH MEAN)
+# ============================================================================
+
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(3*n_cols, 2.2*n_rows), sharex=True)
+axes = axes.ravel()
+
+for ch in range(n_channels):
+    ax = axes[ch]
+    
+    # Plot all epochs for this channel (semi-transparent)
+    for ep in range(n_epochs_merged):
+        ax.plot(times, merged_edata_uV[ep, ch, :], color='C0', alpha=0.15, lw=0.5)
+    
+    # Plot mean on top
+    mean_trace = np.nanmean(merged_edata_uV[:, ch, :], axis=0)
+    ax.plot(times, mean_trace, color='C1', lw=2.0, label='Mean')
+    
+    ax.axvline(0.0, color='k', linestyle='--', alpha=0.6)
+    ax.set_title(ch_names[ch], fontsize=8)
+    if ch % n_cols == 0:
+        ax.set_ylabel('µV')
+    ax.set_xlim(times[0], times[-1])
+    ax.grid(True, alpha=0.25)
+    if ch == 0:
+        ax.legend(loc='upper right', fontsize=8)
+
+for ax in axes[n_channels:]:
+    ax.axis('off')
+
+fig.suptitle(f"Merged Epochs: All {n_epochs_merged} trials per channel (overlay) with mean", fontsize=12)
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.show()
+
+# ============================================================================
+# VISUALIZATION 3: EVOKED RESPONSE (AVERAGE ACROSS ALL EPOCHS)
+# ============================================================================
+
+evoked = merged_epochs.average()
+data_uV = evoked.data * 1e6
+n_ch = len(ch_names)
+
+cmap = plt.get_cmap('tab20')
+colors = cmap(np.linspace(0, 1, n_ch))
+
+fig = plt.figure(figsize=(11, 5))
+ax = fig.add_axes([0.06, 0.12, 0.72, 0.82])
+
+lines = []
+for i in range(n_ch):
+    ln, = ax.plot(times, data_uV[i], color=colors[i], lw=1.2, label=ch_names[i])
+    lines.append(ln)
+
+ax.set_xlim(times[0], times[-1])
+ax.axvline(0.0, color='k', linestyle='--', alpha=0.6, label='Stimulus')
+ax.axhline(0.0, color='k', linestyle='-', alpha=0.4)
+ax.set_xlabel('Time (s)')
+ax.set_ylabel('µV')
+ax.set_title(f'Merged EEG ({n_ch} channels) — mean across {n_epochs_merged} epochs')
+ax.grid(True, alpha=0.3)
+
+# Inset with channel layout
+inset_ax = fig.add_axes([0.80, 0.62, 0.18, 0.30])
+inset_ax.set_xticks([])
+inset_ax.set_yticks([])
+inset_ax.set_aspect('equal')
+
+try:
+    layout = mne.find_layout(evoked.info)
+    pos = np.asarray(layout.pos)
+    layout_names = list(layout.names)
+    name_to_idx = {name: idx for idx, name in enumerate(layout_names)}
+
+    for i, ch in enumerate(ch_names):
+        idx = name_to_idx.get(ch, name_to_idx.get(ch.replace('EEG ', '').strip(), None))
+        if idx is None:
+            continue
+        
+        coords = np.asarray(pos[idx])
+        x, y = float(coords[0]), float(coords[1])
+        
+        inset_ax.scatter(x, y, color=colors[i], edgecolor='k', s=30, zorder=11)
+        label = ch.replace('EEG ', '').strip()
+        inset_ax.text(x, y + 0.025, label, color=colors[i], fontsize=8,
+                      ha='center', va='bottom', zorder=12,
+                      bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.6, edgecolor='none'))
+
+    inset_ax.set_title('Channels', fontsize=9)
+    inset_ax.autoscale(False)
+except Exception as e:
+    print(f"Warning: Could not create layout inset: {e}")
+    inset_ax.text(0.5, 0.5, 'Layout unavailable', ha='center', va='center', transform=inset_ax.transAxes)
+
+plt.show()
+
+# ============================================================================
+# VISUALIZATION 4: TOPOMAPS
+# ============================================================================
+
+try:
+    print("Creating topomaps...")
+    times_top = np.arange(0.0, epoch_tmax, 0.01)  # Every 10ms
+    evoked.plot_topomap(times_top,  vlim=(-100, 100))
+    plt.show()
+except Exception as e:
+    print(f"Warning: Could not create topomaps: {e}")
+
+
+
+print("\nProcessing complete!")
+
+# ========================== Epoch correlation across channels ======================
 
 def compute_epoch_correlation_timeseries(edata, times):
     """
@@ -176,7 +774,7 @@ def compute_epoch_correlation_timeseries(edata, times):
     return correlation_over_time
 
 # Usage:
-corr_time = compute_epoch_correlation_timeseries(edata, times)
+corr_time = compute_epoch_correlation_timeseries(merged_edata, times)
 
 plt.figure(figsize=(12, 4))
 plt.plot(times, corr_time, linewidth=2)
@@ -193,6 +791,8 @@ plt.show()
 threshold = np.percentile(corr_time, 90)
 artifact_times = times[corr_time > threshold]
 print(f"Likely artifact period: {artifact_times[0]:.3f}s to {artifact_times[-1]:.3f}s")
+
+
 # # # =========================== Set bipolar montage ================================
 # # helpers_bipolar_plot.py
 # from typing import List, Tuple, Optional
@@ -395,338 +995,21 @@ print(f"Likely artifact period: {artifact_times[0]:.3f}s to {artifact_times[-1]:
 # times_ms = epochs.times * 1000.0
 # fig, means = plot_bipolar_averages(edata_bip*1000, times_ms, bip_names, ncols=3, figsize=(12,4), title="Bipolar averages")
 
-# ====================== Apply montage =======================================
-
-std = mne.channels.make_standard_montage('standard_1020')
-std_pos = std.get_positions()['ch_pos']  # map like 'F3' -> (x,y,z)
-
-ch_pos = {}
-missing = []
-for ch in epochs.ch_names:
-    std_name = ch.replace('EEG ', '').strip()   # "EEG F3" -> "F3"
-    if std_name in std_pos:
-        ch_pos[ch] = std_pos[std_name]
-    else:
-        missing.append(ch)
-
-print("Matched channels:", list(ch_pos.keys()))
-if missing:
-    print("WARNING - channels not found in standard_1020:", missing)
-
-if len(ch_pos) == 0:
-    raise RuntimeError("No channels matched the standard 10-20 names. Check channel labels.")
-
-montage_subset = mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame='head')
-
-# 2) Attach montage to epochs (and to evoked if already created)
-epochs.set_montage(montage_subset)
-
-mne.viz.plot_sensors(epochs.info, show_names=True)
-plt.title('Sensor positions (mapped to standard 10-20 where available)')
-plt.show()
 
 # PSD
-epochs.average().compute_psd(
+merged_epochs.average().compute_psd(
     method='welch', 
     fmin=0, 
     fmax=200).plot()
 
-# TOPOMAPS
-times_top = np.arange(0.0, 0.05, 0.005)
-epochs.average().plot_topomap(times_top)
 
 mne.viz.plot_epochs_image(
-    epochs,
+    merged_epochs,
     sigma=0.5,
     vmin=-250,
     vmax=250,
     show=True,
 )
-
-
-# Quick checks / visualization
-#  - show average evoked across epochs for first event type (if multiple)
-epochs.average().plot(spatial_colors=True)   # interactive MNE plot
-
-# Plotting mean signal for all channels
-evoked = epochs.average()
-
-# use evoked.data (n_ch x n_times) in Volts; convert to µV for plotting
-data_uV = evoked.data * 1e6
-times = evoked.times
-ch_names = evoked.ch_names
-n_ch = len(ch_names)
-
-# colours for channels
-cmap = plt.get_cmap('tab20')
-colors = cmap(np.linspace(0, 1, n_ch))
-
-# Create a figure and reserve room on the right for the inset
-fig = plt.figure(figsize=(11, 5))
-
-# Main axes: left, bottom, width, height (figure coords)
-ax = fig.add_axes([0.06, 0.12, 0.72, 0.82])   # make width smaller than full figure so inset fits
-lines = []
-for i in range(n_ch):
-    ln, = ax.plot(times, data_uV[i], color=colors[i], lw=1.2)
-    lines.append(ln)
-
-ax.set_xlim(times[0], times[-1])
-ax.axvline(0.0, color='k', linestyle='--', alpha=0.6)
-ax.axhline(0.0, color='k', linestyle='-', alpha=0.4)
-ax.set_xlabel('Time (s)')
-ax.set_ylabel('µV')
-ax.set_title(f'EEG ({n_ch} channels) — mean across {len(epochs):d} epochs')
-
-# Inset axes for head (positioned to the right, outside main trace area)
-inset_ax = fig.add_axes([0.80, 0.62, 0.18, 0.30])  # tweak numbers to refine position & size
-inset_ax.set_xticks([])
-inset_ax.set_yticks([])
-inset_ax.set_aspect('equal')
-
-# Overlay channel NAMES at 2D layout positions, colored to match the traces
-layout = mne.find_layout(evoked.info)
-pos = np.asarray(layout.pos)   # may be (N,2) or (N,3)
-layout_names = list(layout.names)
-name_to_idx = {name: idx for idx, name in enumerate(layout_names)}
-
-for i, ch in enumerate(ch_names):
-    # find matching index in the layout (try exact, then stripped version)
-    idx = name_to_idx.get(ch, name_to_idx.get(ch.replace('EEG ', '').strip(), None))
-    if idx is None:
-        # channel missing from layout (optional: print or skip)
-        # print(f"Warning: channel {ch} not found in layout; skipping label.")
-        continue
-
-    coords = np.asarray(pos[idx])
-    x, y = float(coords[0]), float(coords[1])  # robust to 2D/3D coords
-
-    # plot a small colored dot (optional) so text stands out against head outline
-    inset_ax.scatter(x, y, color=colors[i], edgecolor='k', s=30, zorder=11)
-
-    # channel label (remove "EEG " prefix for compactness)
-    label = ch.replace('EEG ', '').strip()
-
-    # draw the text label in the same color as the trace
-    # optional bbox can be used for readability; remove bbox=dict(...) if you prefer plain text
-    inset_ax.text(x, y + 0.025, label, color=colors[i], fontsize=8,
-                  ha='center', va='bottom', zorder=12,
-                  bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.6, edgecolor='none'))
-
-inset_ax.set_title('Channels', fontsize=9)
-inset_ax.autoscale(False)  # keep inset fixed
-
-# optionally add a legend of channel names + colors (placed between main axes and inset)
-# fig.legend(lines, [ch.replace('EEG ', '') for ch in ch_names], loc='upper left',
-#            bbox_to_anchor=(0.74, 0.96), fontsize='small', frameon=False, ncol=1)
-
-plt.show()
-
-# ----------------- Per channel average ------------------------------
-
-# --- get per-channel mean across epochs ---
-# prefer edata if available, otherwise pull from epochs
-if 'edata' in globals() and edata.ndim == 3:
-    # edata shape: (n_epochs, n_channels, n_times)
-    mean_per_channel = np.nanmean(edata, axis=0)   # shape (n_channels, n_times)
-elif 'epochs' in globals():
-    mean_per_channel = np.nanmean(epochs.get_data(), axis=0)
-else:
-    raise RuntimeError("No epoch data found: provide edata (n_epochs,n_ch,n_times) or an epochs object.")
-
-# --- get time vector and channel names ---
-if 'epochs' in globals():
-    times = epochs.times
-    ch_names = list(epochs.ch_names)
-else:
-    # fallback: try aligned_times or kept_names
-    times = aligned_times if 'aligned_times' in globals() else np.arange(mean_per_channel.shape[1]) / float(sfreq)
-    ch_names = kept_names if 'kept_names' in globals() else [f"ch{i}" for i in range(mean_per_channel.shape[0])]
-
-n_ch, n_times = mean_per_channel.shape
-assert n_ch == len(ch_names), f"Channel name count ({len(ch_names)}) != data channels ({n_ch})"
-
-# --- convert to µV if values are in Volts (heuristic) ---
-# If the max absolute value is small (<1e-2) assume Volts and convert to µV
-if np.nanmax(np.abs(mean_per_channel)) < 1e-2:
-    mean_uV = mean_per_channel * 1e6
-else:
-    mean_uV = mean_per_channel.copy()
-# now mean_uV is (n_channels, n_times) in µV
-
-# --- plotting: one subplot per channel (6 x 4 grid for 24 channels) ---
-n_cols = 6
-n_rows = int(math.ceil(n_ch / n_cols))
-fig, axes = plt.subplots(n_rows, n_cols, figsize=(3*n_cols, 2.2*n_rows), sharex=True)
-axes = axes.ravel()
-
-for i in range(n_ch):
-    ax = axes[i]
-    ax.plot(times, mean_uV[i], color='C0', lw=1)
-    ax.axvline(0.0, color='k', linestyle='--', alpha=0.6)   # event onset / alignment
-    ax.axhline(0, color='k', linestyle='-', alpha=0.4, linewidth=0.8)
-    ax.set_title(ch_names[i], fontsize=8)
-    if i % n_cols == 0:
-        ax.set_ylabel('µV')
-    ax.set_xlim(times[0], times[-1])
-
-for ax in axes[n_ch:]:
-    ax.axis('off')
-
-fig.suptitle("Per-channel mean across all epochs (µV)")
-plt.tight_layout(rect=[0, 0, 1, 0.96])
-plt.show()
-
-
-
-
-def plot_all_epochs_per_channel(
-    edata_sources=None,
-    times=None,
-    ch_names=None,
-    sfreq=None,
-    n_cols=6,
-    epoch_alpha=0.25,
-    epoch_lw=0.6,
-    mean_color='C1',
-    mean_lw=1.5,
-    vmax_abs_convert=1e-2,
-    figsize_per_col=(3, 2.2)
-):
-    """
-    Plot all epochs per channel: each subplot contains all epochs for that channel (overlayed),
-    plus the channel mean on top.
-
-    Parameters
-    ----------
-    edata_sources : dict or None
-        Optional dict of possible variable names to check for epoch data, e.g.
-        {'edata': globals().get('edata'), 'edata_good': globals().get('edata_good'), ...}
-        If None, the function will try common global names itself.
-        Accepted epoch array shape: (n_epochs, n_channels, n_times)
-    times : ndarray or None
-        Time vector (n_times,) in seconds. If None, will attempt to use epochs.times or construct from sfreq.
-    ch_names : list or None
-        Channel names (length n_channels). If None, will try epochs.ch_names or create generic names.
-    sfreq : float or None
-        Sampling frequency (Hz) — used only if times is None to synthesize a time vector.
-    n_cols : int
-        Number of subplot columns.
-    epoch_alpha, epoch_lw : float
-        Alpha and linewidth for individual epoch traces.
-    mean_color, mean_lw : color/float
-        Color and linewidth for the averaged trace plotted on top.
-    vmax_abs_convert : float
-        Threshold to decide if data is in Volts (abs max < threshold) — then convert to µV.
-    figsize_per_col : tuple
-        Width/height multipliers per column used to build figsize.
-    """
-    # Try to locate epoch data if not provided explicitly
-    edata = None
-    if edata_sources is None:
-        # common names used in this session
-        candidates = ['edata', 'edata_uV', 'edata_good', 'edata_baselined', 'edata_cropped_all', 'epochs_data']
-        g = globals()
-        for name in candidates:
-            if name in g and g[name] is not None:
-                arr = g[name]
-                if isinstance(arr, np.ndarray) and arr.ndim == 3:
-                    edata = arr
-                    break
-        # fallback to epochs object if present
-        if edata is None and 'epochs' in g:
-            try:
-                edata = g['epochs'].get_data()
-            except Exception:
-                edata = None
-    else:
-        # check provided dict for valid arrays
-        for name, arr in edata_sources.items():
-            if isinstance(arr, np.ndarray) and arr.ndim == 3:
-                edata = arr
-                break
-
-    if edata is None:
-        raise RuntimeError("No epoch data found. Provide edata (n_epochs,n_ch,n_times) or an epochs object.")
-
-    n_epochs, n_ch, n_times = edata.shape
-
-    # Determine times vector
-    if times is None:
-        g = globals()
-        if 'times_cropped_all' in g:
-            times = g['times_cropped_all']
-        elif 'times' in g:
-            times = g['times']
-        elif 'epochs' in g:
-            try:
-                times = g['epochs'].times
-            except Exception:
-                times = None
-        if times is None:
-            if sfreq is None:
-                # attempt to get sfreq from epochs.info if available
-                if 'epochs' in g and hasattr(g['epochs'], 'info'):
-                    sfreq = g['epochs'].info.get('sfreq', None)
-            if sfreq is None:
-                raise RuntimeError("No time vector available and sfreq not provided.")
-            times = np.arange(n_times) / float(sfreq)
-
-    # Determine channel names
-    if ch_names is None:
-        g = globals()
-        if 'epochs' in g:
-            try:
-                ch_names = list(g['epochs'].ch_names)
-            except Exception:
-                ch_names = None
-        if ch_names is None:
-            ch_names = [f"ch{i}" for i in range(n_ch)]
-
-    assert len(ch_names) == n_ch, f"Channel name count ({len(ch_names)}) != data channels ({n_ch})"
-
-    # Convert to µV if values are in Volts (heuristic)
-    if np.nanmax(np.abs(edata)) < vmax_abs_convert:
-        edata_uV = edata * 1e6
-    else:
-        edata_uV = edata.copy()
-
-    # Prepare plotting grid
-    n_rows = int(math.ceil(n_ch / n_cols))
-    figsize = (figsize_per_col[0] * n_cols, figsize_per_col[1] * n_rows)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, sharex=True)
-    axes = axes.ravel()
-
-    for ch in range(n_ch):
-        ax = axes[ch]
-        # Plot all epochs for this channel
-        for ep in range(n_epochs):
-            ax.plot(times, edata_uV[ep, ch, :], color='C0', alpha=epoch_alpha, lw=epoch_lw)
-
-        # Plot mean on top
-        mean_trace = np.nanmean(edata_uV[:, ch, :], axis=0)
-        ax.plot(times, mean_trace, color=mean_color, lw=mean_lw, label='Mean')
-
-        ax.axvline(0.0, color='k', linestyle='--', alpha=0.6)   # event/stimulus onset
-        ax.set_title(ch_names[ch], fontsize=8)
-        if ch % n_cols == 0:
-            ax.set_ylabel('µV')
-        ax.set_xlim(times[0], times[-1])
-        ax.grid(True, alpha=0.25)
-        if ch == 0:
-            ax.legend(loc='upper right', fontsize=8)
-
-    # Turn off unused axes
-    for ax in axes[n_ch:]:
-        ax.axis('off')
-
-    fig.suptitle("All epochs per channel (overlay) with mean in color", fontsize=12)
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.show()
-
-
-plot_all_epochs_per_channel(edata_sources={'edata': edata}, times=times, ch_names=ch_names, sfreq=sfreq)
-
 
 
 def _lighten_color(color, amount=0.6):
@@ -901,7 +1184,7 @@ def plot_channel_means_with_envelope_same_color_ms(
 # ============ Plot channel means with std envelope ========================
 
 plot_channel_means_with_envelope_same_color_ms(
-    edata_sources={'edata': edata},
+    edata_sources={'edata': merged_edata},
     times=times,
     ch_names=ch_names,
     mean_color='tab:blue',
@@ -926,7 +1209,7 @@ print(f"Removing stimulus artifact: {crop_duration_ms} ms ({crop_samples} sample
 
 # Remove the first N samples (stimulus artifact period)
 # After removal: data starts at ~10.5 ms after stimulus onset
-edata_cropped_all = edata_bip[:, :, crop_samples:] * 1e6
+edata_cropped_all = merged_edata_uV[:, :, crop_samples:]
 orig_times = times[crop_samples:]
 
 # make cropped times start at 0.0 seconds
@@ -955,8 +1238,7 @@ print("VISUALIZING RESULTS")
 print("="*50)
 
 # Get channel names for good epochs
-#eeg_labels = list(epochs.ch_names)
-eeg_labels = bip_names
+eeg_labels = list(merged_epochs.ch_names)
 # Plot evoked potential
 n_ch = evoked_potential.shape[0]
 n_cols = 6
@@ -967,20 +1249,20 @@ axes = axes.ravel()
 
 for i in range(n_ch):
     ax = axes[i]
-    ax.plot(times_cropped_all, evoked_potential[i], color='C0', lw=1.5)
+    ax.plot(times_cropped_all_ms, evoked_potential[i], color='C0', lw=1.5)
     ax.axhline(0, color='k', linestyle='-', alpha=0.4, linewidth=0.8)
     ax.axvline(0.0, color='k', linestyle='--', alpha=0.6, label='Stimulus onset')
     ax.set_title(eeg_labels[i], fontsize=8)
     if i % n_cols == 0:
         ax.set_ylabel('µV')
-    ax.set_xlim(times_cropped_all[0], times_cropped_all[-1])
+    ax.set_xlim(times_cropped_all_ms[0], times_cropped_all_ms[-1])
     ax.set_xlabel('Time (ms)')
     ax.grid(True, alpha=0.3)
 
 for ax in axes[n_ch:]:
     ax.axis('off')
 
-fig.suptitle(f"Evoked Potential After Stimulus Cropping\n({edata.shape[0]} good epochs, stimulus artifact removed)")
+fig.suptitle(f"Evoked Potential After Stimulus Cropping\n({merged_edata.shape[0]} good epochs, stimulus artifact removed)")
 plt.tight_layout(rect=[0, 0, 1, 0.96])
 plt.show()
 
@@ -992,7 +1274,7 @@ ch_idx = 0
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6), sharex=False)
 
 # Before cropping
-mean_before = np.mean(edata_bip[:, ch_idx, :]*1e6, axis=0)
+mean_before = np.mean(merged_edata[:, ch_idx, :]*1e6, axis=0)
 ax1.plot(times, mean_before, color='C0', lw=1.5)
 ax1.axvspan(0, crop_duration_s, alpha=0.3, color='red', label=f'Removed: {crop_duration_ms} ms')
 ax1.axvline(0, color='k', linestyle='--', alpha=0.6)
@@ -1003,9 +1285,9 @@ ax1.grid(True, alpha=0.3)
 
 # After cropping
 mean_after = np.mean(edata_cropped_all[:, ch_idx, :], axis=0)
-ax2.plot(times_cropped_all, mean_after, color='C1', lw=1.5)
+ax2.plot(times_cropped_all*1000, mean_after, color='C1', lw=1.5)
 ax2.axvline(0, color='k', linestyle='--', alpha=0.6, label='Stimulus onset + artifact')
-ax2.set_xlabel('Time (s)')
+ax2.set_xlabel('Time (ms)')
 ax2.set_ylabel('µV')
 ax2.set_title(f'{eeg_labels[ch_idx]} - After Cropping')
 ax2.legend()
@@ -1019,7 +1301,7 @@ plt.show()
 plot_channel_means_with_envelope_same_color_ms(
     edata_sources={'edata': edata_cropped_all},
     times=times_cropped_all,
-    ch_names=bip_names,
+    ch_names=ch_names,
     mean_color='tab:blue',
     envelope_kind='std',
     envelope_alpha=0.35,
@@ -1319,7 +1601,7 @@ else:
 dets, df = plot_channel_averages_with_peaks_legend(
     mean_signals,
     times_ms,
-    channel_names=bip_names,
+    channel_names=ch_names,
     ncols=4,
     figsize=(14, 10),
     include_matsumoto=True,
@@ -1529,20 +1811,43 @@ df_itc = average_itc_per_channel(itc_tf, ch_names, freqs=freqs, times=times_crop
 # df_itc = average_itc_per_channel(itc_alpha, ch_names,
 #                                  save_csv_path='itc_mean_per_channel_alpha.csv', plot_bar=True)
 
-# ================== GROUP AVERAGING ==================
-print("\n" + "="*50)
-print("AVERAGING EPOCHS IN GROUPS OF 40")
-print("="*50)
 
-group_size = 30
-n_good_epochs = edata_cropped_all.shape[0]
-n_groups = int(np.floor(n_good_epochs / group_size))
-remainder = n_good_epochs % group_size
+# ============================================================================
+# GROUP EPOCHS WITH SELECTABLE RANGE
+# ============================================================================
 
-print(f"Total good epochs: {n_good_epochs}")
-print(f"Group size: {group_size}")
+# CONFIGURATION: Select epoch range and group size
+epoch_range_start = 0          # First epoch to include
+epoch_range_end = 100          # Last epoch to include (exclusive, so 0-100 = 100 epochs)
+group_size = 10                # Number of epochs per group
+
+# Validate range
+n_total_epochs = edata_cropped_all.shape[0]
+if epoch_range_end > n_total_epochs:
+    epoch_range_end = n_total_epochs
+    print(f"Warning: epoch_range_end exceeds total epochs. Set to {n_total_epochs}")
+
+if epoch_range_start < 0:
+    epoch_range_start = 0
+    print(f"Warning: epoch_range_start is negative. Set to 0")
+
+# Extract the selected epoch range
+edata_selected = edata_cropped_all[epoch_range_start:epoch_range_end]
+
+print("=" * 80)
+print("GROUPING EPOCHS")
+print("=" * 80)
+print(f"Total epochs available: {n_total_epochs}")
+print(f"Selected range: epochs {epoch_range_start} to {epoch_range_end-1} ({epoch_range_end - epoch_range_start} epochs)")
+print(f"Group size: {group_size}\n")
+
+n_selected_epochs = edata_selected.shape[0]
+n_groups = int(np.floor(n_selected_epochs / group_size))
+remainder = n_selected_epochs % group_size
+
+print(f"Epochs in selected range: {n_selected_epochs}")
 print(f"Number of complete groups: {n_groups}")
-print(f"Remaining epochs: {remainder}")
+print(f"Remaining epochs: {remainder}\n")
 
 # Create grouped averages
 grouped_averages = []
@@ -1553,40 +1858,55 @@ for group_idx in range(n_groups):
     end_idx = start_idx + group_size
     
     # Average this group
-    group_data = edata_cropped_all[start_idx:end_idx]
+    group_data = edata_selected[start_idx:end_idx]
     group_mean = np.mean(group_data, axis=0)  # shape: (n_channels, n_times)
     
     grouped_averages.append(group_mean)
+    
+    # Store info with ABSOLUTE epoch indices (relative to full merged dataset)
+    abs_start = epoch_range_start + start_idx
+    abs_end = epoch_range_start + end_idx
+    
     group_info.append({
         'group_num': group_idx + 1,
-        'start_epoch': start_idx,
-        'end_epoch': end_idx,
+        'start_epoch_abs': abs_start,
+        'end_epoch_abs': abs_end,
+        'start_epoch_rel': start_idx,
+        'end_epoch_rel': end_idx,
         'n_epochs': group_size
     })
     
-    
-    
-    print(f"  Group {group_idx + 1}: epochs {start_idx}-{end_idx-1}")
+    print(f"  Group {group_idx + 1}: epochs {abs_start}-{abs_end-1} (relative: {start_idx}-{end_idx-1})")
 
-# Handle remaining epochs if any
+# Handle remainder
 if remainder > 0:
     start_idx = n_groups * group_size
-    end_idx = n_good_epochs
+    end_idx = start_idx + remainder
     
-    group_data = edata_cropped_all[start_idx:end_idx]
+    group_data = edata_selected[start_idx:end_idx]
     group_mean = np.mean(group_data, axis=0)
     
     grouped_averages.append(group_mean)
+    
+    abs_start = epoch_range_start + start_idx
+    abs_end = epoch_range_start + end_idx
+    
     group_info.append({
         'group_num': n_groups + 1,
-        'start_epoch': start_idx,
-        'end_epoch': end_idx,
-        'n_epochs': remainder})
+        'start_epoch_abs': abs_start,
+        'end_epoch_abs': abs_end,
+        'start_epoch_rel': start_idx,
+        'end_epoch_rel': end_idx,
+        'n_epochs': remainder
+    })
     
-    print(f"  Group {n_groups + 1} (incomplete): epochs {start_idx}-{end_idx-1} ")
+    print(f"  Group {n_groups + 1}: epochs {abs_start}-{abs_end-1} (remainder, n={remainder})")
 
+# Convert to numpy array
 grouped_averages = np.array(grouped_averages)  # shape: (n_groups, n_channels, n_times)
+
 print(f"\nGrouped averages shape: {grouped_averages.shape}")
+print(f"  (n_groups, n_channels, n_times) = ({grouped_averages.shape[0]}, {grouped_averages.shape[1]}, {grouped_averages.shape[2]})")
 
 # ================== GENERATE PLOTS FOR EACH GROUP ==================
 print("\n" + "="*50)
@@ -1620,7 +1940,7 @@ for group_idx in range(len(grouped_averages)):
         ax.axis('off')
     
     # Create informative title
-    title = (f"Group {info['group_num']}: Epochs {info['start_epoch']}-{info['end_epoch']-1} "
+    title = (f"Group {info['group_num']}: Epochs {info['start_epoch_abs']}-{info['end_epoch_abs']-1} "
              f"(n={info['n_epochs']})")
     
     fig.suptitle(title, fontsize=12, fontweight='bold')
@@ -1629,14 +1949,18 @@ for group_idx in range(len(grouped_averages)):
 
 print(f"\n✓ Generated {len(grouped_averages)} plots")
 
-
-# ================== PLOT ALL GROUPS ON SAME FIGURE (Optional) ==================
-print("\n" + "="*50)
-print("CREATING COMPARISON OVERLAY (All Groups)")
-print("="*50)
+# ================== PLOT ALL GROUPS ON SAME FIGURE ==================
+# Ensure n_rows and n_cols are defined
+n_cols = 6  # Adjust as needed
+n_rows = int(np.ceil(n_channels / n_cols))
 
 # Create a figure showing all groups overlaid for each channel
 fig, axes = plt.subplots(n_rows, n_cols, figsize=(3*n_cols, 2.2*n_rows), sharex=True)
+
+# Handle edge case where matplotlib returns 1D array for single row/column
+if n_rows == 1 or n_cols == 1:
+    axes = axes.reshape(n_rows, n_cols)
+
 axes = axes.ravel()
 
 # Define colors for different groups
@@ -1662,48 +1986,21 @@ for ch_idx in range(n_channels):
     ax.set_xlabel('ms')
     ax.grid(True, alpha=0.3)
 
-
 # Hide extra subplots
-for ax in axes[n_channels:]:
-    ax.axis('off')
+for ax_idx in range(n_channels, len(axes)):
+    axes[ax_idx].axis('off')
 
-# Add legend
+# Add legend (only show group labels to avoid duplication)
 handles, labels = axes[0].get_legend_handles_labels()
-fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, -0.01), ncol=len(grouped_averages))
+# Filter to only include group labels (not the phase labels)
+group_handles = handles[:len(grouped_averages)]
+group_labels = labels[:len(grouped_averages)]
+fig.legend(group_handles, group_labels, loc='upper center', 
+           bbox_to_anchor=(0.5, -0.01), ncol=len(grouped_averages))
 
 fig.suptitle("All Groups Overlay - Per Channel Average", fontsize=12, fontweight='bold')
 plt.tight_layout(rect=[0, 0.02, 1, 0.96])
 plt.show()
-
-
-
-# ================== SAVE GROUP AVERAGES ==================
-print("\n" + "="*50)
-print("SAVING GROUP AVERAGES")
-print("="*50)
-
-output_dir = r"C:\Users\marti\OneDrive\Documents\HSJD\Cerebelo\Chimula Mark"
-
-np.save(f"{output_dir}/grouped_averages.npy", grouped_averages)
-np.save(f"{output_dir}/peak_amplitudes.npy", peak_amplitudes)
-
-# Save group info as JSON
-import json
-group_info_json = {
-    f"group_{info['group_num']}": {
-        'epochs': f"{info['start_epoch']}-{info['end_epoch']-1}",
-        'n_epochs': info['n_epochs']
-    }
-    for info in group_info
-}
-
-with open(f"{output_dir}/group_info.json", 'w') as f:
-    json.dump(group_info_json, f, indent=2)
-
-print(f"✓ Saved to {output_dir}/")
-print(f"  - grouped_averages.npy: shape {grouped_averages.shape}")
-print(f"  - peak_amplitudes.npy: shape {peak_amplitudes.shape}")
-print(f"  - group_info.json: group metadata")
 
 
 """
@@ -1730,7 +2027,7 @@ Example (after you already computed grouped_averages and group_info as in your s
 """
 
 
-# --------------------- Detector (copied & used as-is) ---------------------
+# ---------------------  ---------------------
 def detect_ccep_components_for_signal_on_mean(mean_signal: np.ndarray, times_ms: np.ndarray) -> Dict[str, Any]:
     t = np.asarray(times_ms)
     y = np.asarray(mean_signal)
