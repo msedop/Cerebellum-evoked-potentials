@@ -19,7 +19,7 @@ import pandas as pd
 from tensorpac.utils import ITC, PSD
 
 # Specify the full path to your EDF file
-file_path = r"C:\Users\msedo\Documents\Cerebelo\Chimula Mark\13.14_stim_2.edf"  # Change this to your file path
+file_path = r"C:\Users\marti\Documents\HSJD\Cerebellum Evoked Potentials\Chimula Mark\13.14_stim_2.edf"  # Change this to your file path
 
 raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
 raw.drop_channels( ['Chin+','ECG+','DI+','DD+','RONQ+','CAN+','TER+','PCO2+','EtCO+','Pos+','Tor+','Abd+','TIBI+','TIBD+','thor+','abdo+','PULS+','BEAT+','SpO2+','MKR+'])
@@ -320,7 +320,7 @@ axes = axes.ravel()
 
 for i in range(n_ch):
     ax = axes[i]
-    ax.plot(times, mean_uV[i], color='C0', lw=1)
+    ax.plot(times, mean_uV[i], color='C0', lw=2)
     ax.axvline(0.0, color='k', linestyle='--', alpha=0.6)   # event onset / alignment
     ax.axhline(0, color='k', linestyle='-', alpha=0.4, linewidth=0.8)
     ax.set_title(ch_names[i], fontsize=8)
@@ -753,7 +753,7 @@ print("CROPPING STIMULUS ARTIFACT")
 print("="*50)
 
 # Define stimulus artifact duration
-crop_duration_ms = 100 # should be 10.5
+crop_duration_ms = 1 # should be 10.5
 crop_duration_s = crop_duration_ms / 1000.0
 crop_samples = int(np.round(crop_duration_s * sfreq))
 
