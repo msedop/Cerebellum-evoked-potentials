@@ -19,7 +19,7 @@ from tensorpac.utils import ITC, PSD
 # CONFIGURATION
 # ============================================================================
 
-base_path = r"C:\Users\marti\Documents\HSJD\CCEPs\Martin Garcia"
+base_path = r"C:\Users\msedo\Documents\CCEPs\Martin Garcia"
 
 # List of EDF files to process (in temporal order)
 edf_files = [
@@ -48,7 +48,7 @@ h_freq = 70.0  # low-pass cutoff (Hz)
 
 # Epoching parameters
 epoch_tmin = 0.0
-epoch_tmax = 0.22
+epoch_tmax = 0.25
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -690,6 +690,7 @@ for i in range(n_ch):
 
 ax.set_xlim(times[0], times[-1])
 ax.axvline(0.0, color='k', linestyle='--', alpha=0.6, label='Stimulus')
+ax.axvline(0.07, color='k', linestyle='--', alpha=0.6, label='Stimulus')
 ax.axhline(0.0, color='k', linestyle='-', alpha=0.4)
 ax.set_xlabel('Time (s)')
 ax.set_ylabel('µV')
@@ -1201,7 +1202,7 @@ print("CROPPING STIMULUS ARTIFACT")
 print("="*50)
 
 # Define stimulus artifact duration
-crop_duration_ms = 50 # should be 10.5
+crop_duration_ms = 70 # should be 10.5
 crop_duration_s = crop_duration_ms / 1000.0
 crop_samples = int(np.round(crop_duration_s * sfreq))
 
@@ -1345,10 +1346,10 @@ def detect_ccep_components_for_signal_on_mean(mean_signal: np.ndarray, times_ms:
     y = np.asarray(mean_signal)
 
     # Define windows in ms (customize if needed)
-    mask_section1 = (t >= 12) & (t <= 27)   # N1 search window
-    mask_section2 = (t >= 12) & (t <= 50)   # P2 search window
-    mask_section3 = (t >= 40) & (t <= 140)  # N2 search window
-    mask_section4 = (t >= 6)  & (t <= 12)   # P1 search window
+    mask_section1 = (t >= 12) & (t <= 43)   # N1 search window
+    mask_section2 = (t >= 43) & (t <= 90)   # P2 search window
+    mask_section3 = (t >= 90) & (t <= 150)  # N2 search window
+    mask_section4 = (t >= 6)  & (t <= 15)   # P1 search window
 
     res = {
         'P1_idx': None, 'P1_Latency': np.nan, 'P1_Amplitude': np.nan, 'P1_y': np.nan,
@@ -1818,7 +1819,7 @@ df_itc = average_itc_per_channel(itc_tf, ch_names, freqs=freqs, times=times_crop
 
 # CONFIGURATION: Select epoch range and group size
 epoch_range_start = 0          # First epoch to include
-epoch_range_end = 100          # Last epoch to include (exclusive, so 0-100 = 100 epochs)
+epoch_range_end = 246          # Last epoch to include (exclusive, so 0-100 = 100 epochs)
 group_size = 10                # Number of epochs per group
 
 # Validate range
